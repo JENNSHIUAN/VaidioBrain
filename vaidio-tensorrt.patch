@@ -1,0 +1,4056 @@
+From 333eb9ab03ff578b9798254a4490c704559b20e6 Mon Sep 17 00:00:00 2001
+From: Frank_IY0125 <Frank_IY0125@bitbucket.org>
+Date: Wed, 13 Dec 2023 08:34:23 -0500
+Subject: [PATCH] test
+
+---
+ CMakeLists.txt                  |  22 +-
+ modules/calibrator.cpp          |  15 +-
+ modules/calibrator.h            |   8 +-
+ modules/chunk.cu                |  89 +++++---
+ modules/chunk.h                 |  67 +++---
+ modules/class_detector.h        |  18 +-
+ modules/class_yolo_detector.hpp |  12 +-
+ modules/decodeTensorCUDA.cu     |  97 ++++++++
+ modules/decodeTensorCUDA.h      |   6 +
+ modules/detect.cu               |  38 ++-
+ modules/detect.h                |  63 ++---
+ modules/ds_image.cpp            |   8 +-
+ modules/hardswish.cu            |  46 ++--
+ modules/hardswish.h             |  64 +++---
+ modules/mish.cu                 |  84 ++++---
+ modules/mish.h                  |  68 +++---
+ modules/plugin_factory.cpp      | 393 ++++++++++++++++++--------------
+ modules/plugin_factory.h        | 251 ++++++++++++--------
+ modules/swish.cu                | 218 ++++++++++++++++++
+ modules/swish.h                 | 106 +++++++++
+ modules/trt_utils.cpp           | 261 +++++++++++++++++++--
+ modules/trt_utils.h             | 117 +++++++---
+ modules/yolo.cpp                | 211 ++++++++++++-----
+ modules/yolo.h                  |  24 +-
+ modules/yolov5.cpp              |  51 ++---
+ modules/yolov7.cpp              |  75 ++++++
+ modules/yolov7.h                |  17 ++
+ samples/ModelWrapper.cpp        | 124 ++++++++++
+ samples/ModelWrapper.h          |  22 ++
+ samples/sample_detector.cpp     | 105 +++------
+ 30 files changed, 1960 insertions(+), 720 deletions(-)
+ create mode 100755 modules/decodeTensorCUDA.cu
+ create mode 100755 modules/decodeTensorCUDA.h
+ create mode 100755 modules/swish.cu
+ create mode 100755 modules/swish.h
+ create mode 100755 modules/yolov7.cpp
+ create mode 100755 modules/yolov7.h
+ create mode 100755 samples/ModelWrapper.cpp
+ create mode 100755 samples/ModelWrapper.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8ae8aef..dbab331 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -7,25 +7,29 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -O3 -Wno-write-strings")
+ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-rpath -Wl,$ORIGIN")
+ 
+ #cuda
+-#export PATH=/usr/local/cuda-11.0/bin:$PATH
+-#include_directories(/usr/local/cuda/include)
+-#link_directories(/usr/local/cuda/lib64)
+ find_package(CUDA REQUIRED)
+ 
+ #opencv
+-#set(OpenCV_DIR /opt/opencv-4.1.2/share/OpenCV)
+ find_package(OpenCV REQUIRED)
+ 
++#jni
++include_directories(/usr/lib/jvm/java-1.11.0-openjdk-amd64/include /usr/lib/jvm/java-1.11.0-openjdk-amd64/include/linux)
++
+ #detector lib (cuda)
+ file(GLOB_RECURSE sources modules/*.hpp modules/*.cpp modules/*.h modules/*.cu extra/*.h)
+ add_library(detector SHARED ${sources})
+ target_include_directories(detector PRIVATE extra/ modules/ ${OpenCV_INCLUDE_DIRS} ${CUDA_TOOLKIT_ROOT_DIR}/include)
+-target_link_libraries(detector nvinfer nvinfer_plugin nvcaffe_parser "stdc++fs")
++target_link_libraries(detector nvinfer nvinfer_plugin "stdc++fs" ${JNI_LIBRARIES})
++
++#vaidio-trt
++add_executable(vaidio-trt samples/sample_detector.cpp)				  
++target_include_directories(vaidio-trt PRIVATE modules/ extra/)
++target_link_libraries(vaidio-trt detector ${OpenCV_LIBS})
+ 
+-#sample
+-add_executable(yolo-trt samples/sample_detector.cpp)				  
+-target_include_directories(yolo-trt PRIVATE modules/ extra/)
+-target_link_libraries(yolo-trt detector ${OpenCV_LIBS})
++#jni-link
++add_library(jni-link SHARED samples/ModelWrapper.cpp)				  
++target_include_directories(jni-link PRIVATE modules/ extra/ sample/)
++target_link_libraries(jni-link detector ${OpenCV_LIBS})
+ 
+ 
+ 
+diff --git a/modules/calibrator.cpp b/modules/calibrator.cpp
+index 773a241..9a4fb51 100644
+--- a/modules/calibrator.cpp
++++ b/modules/calibrator.cpp
+@@ -27,7 +27,8 @@ SOFTWARE.
+ #include <fstream>
+ #include <iostream>
+ #include <iterator>
+-
++#include <cuda_runtime.h>
++#include <cuda.h>
+ Int8EntropyCalibrator::Int8EntropyCalibrator(const uint32_t& batchSize, const std::string& calibImages,
+ 	const std::string& calibImagesPath,
+ 	const std::string& calibTableFilePath,
+@@ -57,7 +58,7 @@ Int8EntropyCalibrator::Int8EntropyCalibrator(const uint32_t& batchSize, const st
+ 
+ Int8EntropyCalibrator::~Int8EntropyCalibrator() { NV_CUDA_CHECK(cudaFree(m_DeviceInput)); }
+ 
+-bool Int8EntropyCalibrator::getBatch(void* bindings[], const char* names[], int nbBindings)
++bool Int8EntropyCalibrator::getBatch(void* bindings[], const char* names[], int nbBindings)noexcept
+ {
+     if (m_ImageIndex + m_BatchSize >= m_ImageList.size()) return false;
+ 
+@@ -78,7 +79,7 @@ bool Int8EntropyCalibrator::getBatch(void* bindings[], const char* names[], int
+     return true;
+ }
+ 
+-const void* Int8EntropyCalibrator::readCalibrationCache(size_t& length)
++const void* Int8EntropyCalibrator::readCalibrationCache(size_t& length) noexcept
+ {
+     void* output;
+     m_CalibrationCache.clear();
+@@ -92,20 +93,22 @@ const void* Int8EntropyCalibrator::readCalibrationCache(size_t& length)
+     length = m_CalibrationCache.size();
+     if (length)
+     {
+-        std::cout << "Using cached calibration table to build the engine" << std::endl;
++        std::cout << "Using cached calibration table " << m_CalibTableFilePath
++            << " to build the engine" << std::endl;
+         output = &m_CalibrationCache[0];
+     }
+ 
+     else
+     {
+-        std::cout << "New calibration table will be created to build the engine" << std::endl;
++        std::cout << "New calibration table " << m_CalibTableFilePath
++            << " will be created to build the engine" << std::endl;
+         output = nullptr;
+     }
+ 
+     return output;
+ }
+ 
+-void Int8EntropyCalibrator::writeCalibrationCache(const void* cache, size_t length)
++void Int8EntropyCalibrator::writeCalibrationCache(const void* cache, size_t length) noexcept
+ {
+     assert(!m_CalibTableFilePath.empty());
+     std::ofstream output(m_CalibTableFilePath, std::ios::binary);
+diff --git a/modules/calibrator.h b/modules/calibrator.h
+index 9c09639..d0797e1 100644
+--- a/modules/calibrator.h
++++ b/modules/calibrator.h
+@@ -38,10 +38,10 @@ public:
+ 							const std::string& inputBlobName,const std::string &s_net_type_);
+     virtual ~Int8EntropyCalibrator();
+ 
+-    int getBatchSize() const override { return m_BatchSize; }
+-    bool getBatch(void* bindings[], const char* names[], int nbBindings) override;
+-    const void* readCalibrationCache(size_t& length) override;
+-    void writeCalibrationCache(const void* cache, size_t length) override;
++    int getBatchSize() const noexcept  override { return m_BatchSize; }
++    bool getBatch(void* bindings[], const char* names[], int nbBindings) noexcept  override;
++    const void* readCalibrationCache(size_t& length) noexcept  override;
++    void writeCalibrationCache(const void* cache, size_t length) noexcept  override;
+ 
+ private:
+     const uint32_t m_BatchSize;
+diff --git a/modules/chunk.cu b/modules/chunk.cu
+index 1eb497b..ac354af 100644
+--- a/modules/chunk.cu
++++ b/modules/chunk.cu
+@@ -30,97 +30,103 @@ namespace nvinfer1
+ 	{
+ 
+ 	}
+-	int Chunk::getNbOutputs() const
++	int Chunk::getNbOutputs() const noexcept
+ 	{
+ 		return 2;
+ 	}
+ 
+-	Dims Chunk::getOutputDimensions(int index, const Dims* inputs, int nbInputDims)
++	Dims Chunk::getOutputDimensions(int index, const Dims* inputs, int nbInputDims)noexcept
+ 	{
+ 		assert(nbInputDims == 1);
+ 		assert(index == 0 || index == 1);
+ 		return Dims3(inputs[0].d[0] / 2, inputs[0].d[1], inputs[0].d[2]);
+ 	}
+ 
+-	int Chunk::initialize()
++	int Chunk::initialize() noexcept
+ 	{
+ 		return 0;
+ 	}
+ 
+-	void Chunk::terminate()
++	void Chunk::terminate() noexcept
+ 	{
+ 	}
+ 
+-	size_t Chunk::getWorkspaceSize(int maxBatchSize) const
++	size_t Chunk::getWorkspaceSize(int maxBatchSize) const noexcept
+ 	{
+ 		return 0;
+ 	}
+ 	
+-	int Chunk::enqueue(int batchSize,
++	/*int Chunk::enqueue(int batchSize,
+ 		const void* const* inputs,
+ 		void** outputs,
+ 		void* workspace,
+-		cudaStream_t stream)
++		cudaStream_t stream)noexcept*/
++
++	int Chunk::enqueue(int batchSize, 
++		const void* const* inputs,
++		void* const* outputs, 
++		void* workspace,
++		cudaStream_t stream) noexcept
+ 	{
+ 		//batch
+ 		for (int b = 0; b < batchSize; ++b)
+ 		{
+-			NV_CUDA_CHECK(cudaMemcpy((char*)outputs[0] + b * _n_size_split, (char*)inputs[0] + b * 2 * _n_size_split, _n_size_split, cudaMemcpyDeviceToDevice));
+-			NV_CUDA_CHECK(cudaMemcpy((char*)outputs[1] + b * _n_size_split, (char*)inputs[0] + b * 2 * _n_size_split + _n_size_split, _n_size_split, cudaMemcpyDeviceToDevice));
++			NV_CUDA_CHECK(cudaMemcpyAsync((char*)outputs[0] + b * _n_size_split, (char*)inputs[0] + b * 2 * _n_size_split, _n_size_split, cudaMemcpyDeviceToDevice, stream));
++			NV_CUDA_CHECK(cudaMemcpyAsync((char*)outputs[1] + b * _n_size_split, (char*)inputs[0] + b * 2 * _n_size_split + _n_size_split, _n_size_split, cudaMemcpyDeviceToDevice, stream));
+ 		}
+ 	//	NV_CUDA_CHECK(cudaMemcpy(outputs[0], inputs[0], _n_size_split, cudaMemcpyDeviceToDevice));
+ 	//	NV_CUDA_CHECK(cudaMemcpy(outputs[1], (void*)((char*)inputs[0] + _n_size_split), _n_size_split, cudaMemcpyDeviceToDevice));
+ 		return 0;
+ 	}
+ 
+-	size_t Chunk::getSerializationSize() const
++	size_t Chunk::getSerializationSize() const noexcept
+ 	{
+ 		return sizeof(_n_size_split);
+ 	}
+ 
+-	void Chunk::serialize(void *buffer)const
++	void Chunk::serialize(void *buffer)const noexcept
+ 	{
+ 		*reinterpret_cast<int*>(buffer) = _n_size_split;
+ 	}
+ 	
+-	const char* Chunk::getPluginType()const
++	const char* Chunk::getPluginType()const noexcept
+ 	{
+ 		return "CHUNK_TRT";
+ 	}
+-	const char* Chunk::getPluginVersion() const
++	const char* Chunk::getPluginVersion() const noexcept
+ 	{	
+ 		return "1.0";
+ 	}
+ 
+-	void Chunk::destroy()
++	void Chunk::destroy() noexcept
+ 	{
+ 		delete this;
+ 	}
+ 	
+-	void Chunk::setPluginNamespace(const char* pluginNamespace)
++	void Chunk::setPluginNamespace(const char* pluginNamespace) noexcept
+ 	{
+ 		_s_plugin_namespace = pluginNamespace;
+ 	}
+ 
+-	const char* Chunk::getPluginNamespace() const
++	const char* Chunk::getPluginNamespace() const noexcept
+ 	{
+ 		return _s_plugin_namespace.c_str();
+ 	}
+ 
+ 	DataType Chunk::getOutputDataType(int index,
+ 		const nvinfer1::DataType* inputTypes,
+-		int nbInputs) const
++		int nbInputs) const noexcept
+ 	{
+ 		assert(index == 0 || index == 1);
+ 		return DataType::kFLOAT;
+ 	}
+ 
+-	bool Chunk::isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const
++	bool Chunk::isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const noexcept
+ 	{
+ 		return false;
+ 	}
+ 
+-	bool Chunk::canBroadcastInputAcrossBatch(int inputIndex) const
++	bool Chunk::canBroadcastInputAcrossBatch(int inputIndex) const noexcept
+ 	{
+ 		return false;
+ 	}
+@@ -133,8 +139,37 @@ namespace nvinfer1
+ 	}
+ 	void Chunk::detachFromContext() {}
+ 
++	bool Chunk::supportsFormat(DataType type, PluginFormat format) const noexcept
++	{
++		return (type == DataType::kFLOAT && format == PluginFormat::kLINEAR);
++	}
++
++	void Chunk::configureWithFormat(const Dims* inputDims, int nbInputs, const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept
++	{
++		size_t typeSize = sizeof(float);
++		switch (type)
++        {
++        case DataType::kFLOAT:
++            typeSize = sizeof(float);
++            break;
++        case DataType::kHALF:
++            typeSize = sizeof(float) / 2;
++            break;
++        case DataType::kINT8:
++            typeSize = 1;
++            break;
++        case DataType::kINT32:
++            typeSize = 4;
++            break;
++        case DataType::kBOOL:
++            typeSize = 1;
++            break;
++        }
++		_n_size_split = inputDims->d[0] / 2 * inputDims->d[1] * inputDims->d[2] * typeSize;
++	}
++
+ 	// Clone the plugin
+-	IPluginV2IOExt* Chunk::clone() const
++	IPluginV2* Chunk::clone() const noexcept
+ 	{
+ 		Chunk *p = new Chunk();
+ 		p->_n_size_split = _n_size_split;
+@@ -153,41 +188,41 @@ namespace nvinfer1
+ 		_fc.fields = _vec_plugin_attributes.data();
+ 	}
+ 
+-	const char* ChunkPluginCreator::getPluginName() const
++	const char* ChunkPluginCreator::getPluginName() const noexcept
+ 	{
+ 		return "CHUNK_TRT";
+ 	}
+ 	
+-	const char* ChunkPluginCreator::getPluginVersion() const
++	const char* ChunkPluginCreator::getPluginVersion() const noexcept
+ 	{
+ 		return "1.0";
+ 	}
+ 
+-	const PluginFieldCollection* ChunkPluginCreator::getFieldNames()
++	const PluginFieldCollection* ChunkPluginCreator::getFieldNames()noexcept
+ 	{
+ 		return &_fc;
+ 	}
+ 
+-	IPluginV2IOExt* ChunkPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc)
++	IPluginV2* ChunkPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc)noexcept
+ 	{
+ 		Chunk* obj = new Chunk();
+ 		obj->setPluginNamespace(_s_name_space.c_str());
+ 		return obj;
+ 	}
+ 
+-	IPluginV2IOExt* ChunkPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength)
++	IPluginV2* ChunkPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength)noexcept
+ 	{
+ 		Chunk* obj = new Chunk(serialData,serialLength);
+ 		obj->setPluginNamespace(_s_name_space.c_str());
+ 		return obj;
+ 	}
+ 
+-	void ChunkPluginCreator::setPluginNamespace(const char* libNamespace)
++	void ChunkPluginCreator::setPluginNamespace(const char* libNamespace)noexcept
+ 	{
+ 		_s_name_space = libNamespace;
+ 	}
+ 
+-	const char* ChunkPluginCreator::getPluginNamespace() const
++	const char* ChunkPluginCreator::getPluginNamespace() const noexcept
+ 	{
+ 		return _s_name_space.c_str();
+ 	}
+diff --git a/modules/chunk.h b/modules/chunk.h
+index 1e940eb..121eb6e 100644
+--- a/modules/chunk.h
++++ b/modules/chunk.h
+@@ -18,40 +18,47 @@
+ 
+ namespace nvinfer1
+ {
+-	class Chunk : public IPluginV2IOExt
++	class Chunk : public IPluginV2
+ 	{
+ 	public:
+ 		Chunk();
+ 		Chunk(const void* buffer, size_t length);
+ 		~Chunk();
+-		int getNbOutputs()const override;
+-		Dims getOutputDimensions(int index, const Dims* inputs, int nbInputDims) override;
+-		int initialize() override;
+-		void terminate() override;
+-		size_t getWorkspaceSize(int maxBatchSize) const override;
+-		int enqueue(int batchSize, const void* const* inputs, void** outputs, void* workspace, cudaStream_t stream)override;
+-		size_t getSerializationSize() const override;
+-		void serialize(void* buffer) const override;
+-		const char* getPluginType() const override;
+-		const char* getPluginVersion() const override;
+-		void destroy() override;
+-		void setPluginNamespace(const char* pluginNamespace) override;
+-		const char* getPluginNamespace() const override;
+-		DataType getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const override;
+-		bool isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const override;
+-		bool canBroadcastInputAcrossBatch(int inputIndex) const override;
++		int getNbOutputs()const noexcept override;
++		Dims getOutputDimensions(int index, const Dims* inputs, int nbInputDims)noexcept  override;
++		int initialize()noexcept  override;
++		void terminate()noexcept  override;
++		size_t getWorkspaceSize(int maxBatchSize) const noexcept  override;
++	//	int enqueue(int batchSize, const void* const* inputs, void** outputs, void* workspace, cudaStream_t stream)noexcept override;
++
++		int enqueue(int batchSize, const void* const* inputs, void* const* outputs, void* workspace,
++			cudaStream_t stream) noexcept override;
++
++		size_t getSerializationSize() const noexcept  override;
++		void serialize(void* buffer) const noexcept  override;
++		const char* getPluginType() const noexcept  override;
++		const char* getPluginVersion() const noexcept  override;
++		void destroy()noexcept  override;
++		void setPluginNamespace(const char* pluginNamespace)noexcept  override;
++		const char* getPluginNamespace() const noexcept  override;
++		DataType getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept;
++		bool isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const noexcept;
++		bool canBroadcastInputAcrossBatch(int inputIndex) const noexcept;
+ 		void attachToContext(
+-			cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator) override;
+-		void configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput) override;
+-		void detachFromContext() override;
+-		bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) const override
++			cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator);
++		void configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput);
++		void detachFromContext();
++		bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) const
+ 		{
+ 			return inOut[pos].format == TensorFormat::kLINEAR && inOut[pos].type == DataType::kFLOAT;
+ 		}
+-		IPluginV2IOExt* clone() const override;
++		IPluginV2* clone() const noexcept  override;
++		bool supportsFormat(DataType type, PluginFormat format) const noexcept override;
++		void configureWithFormat(const Dims* inputDims, int nbInputs, const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept override;
++
+ 	private:
+ 		std::string _s_plugin_namespace;
+-		int _n_size_split;
++		int _n_size_split = 0;
+ 	};
+ 
+ 	class ChunkPluginCreator : public IPluginCreator
+@@ -59,13 +66,13 @@ namespace nvinfer1
+ 	public:
+ 		ChunkPluginCreator();
+ 		~ChunkPluginCreator() override = default;
+-		const char* getPluginName()const override;
+-		const char* getPluginVersion() const override;
+-		const PluginFieldCollection* getFieldNames() override;
+-		IPluginV2IOExt* createPlugin(const char* name, const PluginFieldCollection* fc) override;
+-		IPluginV2IOExt* deserializePlugin(const char* name, const void* serialData, size_t serialLength) override;
+-		void setPluginNamespace(const char* libNamespace) override;
+-		const char* getPluginNamespace() const override;
++		const char* getPluginName()const noexcept  override;
++		const char* getPluginVersion() const noexcept  override;
++		const PluginFieldCollection* getFieldNames()noexcept  override;
++		IPluginV2* createPlugin(const char* name, const PluginFieldCollection* fc)noexcept  override;
++		IPluginV2* deserializePlugin(const char* name, const void* serialData, size_t serialLength)noexcept  override;
++		void setPluginNamespace(const char* libNamespace)noexcept  override;
++		const char* getPluginNamespace() const noexcept  override;
+ 	private:
+ 		std::string _s_name_space;
+ 		static PluginFieldCollection _fc;
+diff --git a/modules/class_detector.h b/modules/class_detector.h
+index 1da6f82..705a403 100644
+--- a/modules/class_detector.h
++++ b/modules/class_detector.h
+@@ -12,7 +12,7 @@ struct Result
+ 	cv::Rect rect;
+ };
+ 
+-typedef std::vector<Result> BatchResult;
++using BatchResult = std::vector<Result>;
+ 
+ enum ModelType
+ {
+@@ -22,7 +22,9 @@ enum ModelType
+ 	YOLOV3_TINY,
+ 	YOLOV4,
+ 	YOLOV4_TINY,
+-	YOLOV5
++	YOLOV5,
++	YOLOV7,
++	YOLOV7_TINY
+ };
+ 
+ enum Precision
+@@ -34,19 +36,23 @@ enum Precision
+ 
+ struct Config
+ {
+-	std::string file_model_cfg					= "configs/yolov3.cfg";
++	std::string file_model_cfg					= "configs/yolov4.cfg";
+ 
+-	std::string file_model_weights				= "configs/yolov3.weights";
++	std::string file_model_weights				= "configs/yolov4.weights";
+ 
+-	float detect_thresh							= 0.9;
++	float detect_thresh							= 0.5;
+ 
+-	ModelType	net_type						= YOLOV3;
++	float nms_thresh							= 0.5;
++
++	ModelType	net_type						= YOLOV4;
+ 
+ 	Precision	inference_precison				= FP32;
+ 	
+ 	int	gpu_id									= 0;
+ 
+ 	std::string calibration_image_list_file_txt = "configs/calibration_images.txt";
++	std::string calibration_table_path = "configs/calibration.table";
++	std::string engine_path = "configs/test.engine";
+ 
+ };
+ 
+diff --git a/modules/class_yolo_detector.hpp b/modules/class_yolo_detector.hpp
+index a70c57e..daf0809 100644
+--- a/modules/class_yolo_detector.hpp
++++ b/modules/class_yolo_detector.hpp
+@@ -9,6 +9,7 @@
+ #include "yolov3.h"
+ #include "yolov4.h"
+ #include "yolov5.h"
++#include "yolov7.h"
+ 
+ #include <experimental/filesystem>
+ #include <fstream>
+@@ -109,15 +110,16 @@ private:
+ 		assert(npos != std::string::npos
+ 			&& "wts file file not recognised. File needs to be of '.weights' format");
+ 		_yolo_info.data_path = _yolo_info.wtsFilePath.substr(0, npos);
+-		_yolo_info.calibrationTablePath = _yolo_info.data_path + "-calibration.table";
++		_yolo_info.calibrationTablePath = _config.calibration_table_path;
+ 		_yolo_info.inputBlobName = "data";
++		_yolo_info.enginePath = _config.engine_path;
+ 
+ 		_infer_param.printPerfInfo = false;
+ 		_infer_param.printPredictionInfo = false;
+ 		_infer_param.calibImages = _config.calibration_image_list_file_txt;
+ 		_infer_param.calibImagesPath = "";
+ 		_infer_param.probThresh = _config.detect_thresh;
+-		_infer_param.nmsThresh = 0.5;
++		_infer_param.nmsThresh = _config.nms_thresh;
+ 	}
+ 
+ 	void build_net()
+@@ -138,6 +140,10 @@ private:
+ 		{
+ 			_p_net = std::unique_ptr<Yolo>{ new YoloV5(_yolo_info,_infer_param) };
+ 		}
++		else if (_config.net_type == YOLOV7 || _config.net_type == YOLOV7_TINY)
++		{
++			_p_net = std::unique_ptr<Yolo>{ new YoloV7(_yolo_info,_infer_param) };
++		}
+ 		else
+ 		{
+ 			assert(false && "Unrecognised network_type.");
+@@ -148,7 +154,7 @@ private:
+ 	Config _config;
+ 	NetworkInfo _yolo_info;
+ 	InferParams _infer_param;
+-	std::vector<std::string> _vec_net_type{ "yolov2","yolov3","yolov2-tiny","yolov3-tiny","yolov4","yolov4-tiny","yolov5" };
++	std::vector<std::string> _vec_net_type{ "yolov2","yolov3","yolov2-tiny","yolov3-tiny","yolov4","yolov4-tiny","yolov5","yolov7","yolov7-tiny" };
+ 	std::vector<std::string> _vec_precision{ "kINT8","kHALF","kFLOAT" };
+ 	std::unique_ptr<Yolo> _p_net = nullptr;
+ 	Timer _m_timer;
+diff --git a/modules/decodeTensorCUDA.cu b/modules/decodeTensorCUDA.cu
+new file mode 100755
+index 0000000..fc78697
+--- /dev/null
++++ b/modules/decodeTensorCUDA.cu
+@@ -0,0 +1,97 @@
++#include "decodeTensorCUDA.h"
++__global__ void decodeTensorKernel(
++    float* detections, uint32_t* masks, float* anchors, float* boxes, uint32_t grid_h, uint32_t grid_w, uint32_t numClasses, uint32_t numBBoxes)
++{
++    // get idx
++    uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
++    uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
++    if (y >= grid_h || x >= grid_w) return;
++
++    const int numGridCells = grid_h * grid_w;
++
++    for (uint32_t b = 0; b < numBBoxes; ++b)
++    {
++        const float pw = anchors[masks[b] * 2];
++        const float ph = anchors[masks[b] * 2 + 1];
++
++        // printf("pw %f, ph %f \n",  pw, ph);
++        const uint32_t bbindex = y * grid_w + x;
++        boxes[18 * bbindex + 6 * b + 0] = x + detections[bbindex + numGridCells * (b * (5 + numClasses) + 0)];
++  
++        boxes[18 * bbindex + 6 * b + 1] = y + detections[bbindex + numGridCells * (b * (5 + numClasses) + 1)];
++        boxes[18 * bbindex + 6 * b + 2] = pw * detections[bbindex + numGridCells * (b * (5 + numClasses) + 2)];
++        boxes[18 * bbindex + 6 * b + 3] = ph * detections[bbindex + numGridCells * (b * (5 + numClasses) + 3)];
++
++        // printf("x %f y %f w %f h %f\n", boxes[18 * bbindex + 6 * b + 0], boxes[18 * bbindex + 6 * b + 1], boxes[18 * bbindex + 6 * b + 2], boxes[18 * bbindex + 6 * b + 3]);
++
++        const float objectness = detections[bbindex + numGridCells * (b * (5 + numClasses) + 4)];
++        float maxProb = 0.0f;
++        int maxIndex = -1;
++
++        for (uint32_t i = 0; i < numClasses; ++i)
++        {
++            float prob = detections[bbindex + numGridCells * (b * (5 + numClasses) + (5 + i))];
++
++            if (prob > maxProb)
++            {
++                maxProb = prob;
++                maxIndex = i;
++            }
++        }
++        // printf("objectness * maxProb  %f , objectness %f , maxProb %f \n", objectness * maxProb, objectness, maxProb);
++        boxes[18 * bbindex + 6 * b + 4] = objectness * maxProb;
++        boxes[18 * bbindex + 6 * b + 5] = (float) maxIndex;
++    }
++}
++
++float* decodeTensorCUDA(const int imageIdx, const TensorInfo& tensor)
++{
++    // host
++    int boxes_bytes = 6*sizeof(float)*tensor.grid_h*tensor.grid_w*tensor.numBBoxes; // x y w h maxProb maxIndex 6个元素
++	const float* detections = &tensor.hostBuffer[imageIdx * tensor.volume];
++    float* boxes = (float*) malloc(boxes_bytes);
++
++    uint32_t grid_h = tensor.grid_h;
++    uint32_t grid_w = tensor.grid_w;
++    uint32_t numClasses = tensor.numClasses;
++    uint32_t numBBoxes = tensor.numBBoxes;
++
++    // device
++    float* d_detections;
++    int detections_bytes = sizeof(float) * grid_h * grid_w * (5 + numClasses) * numBBoxes;
++    cudaMalloc((void**) &d_detections, detections_bytes);
++    cudaMemcpy((void*) d_detections, (void*) detections, detections_bytes, cudaMemcpyHostToDevice);
++
++    uint32_t* d_masks;
++    cudaMalloc((void**) &d_masks, sizeof(uint32_t)*numBBoxes);
++    cudaMemcpy((void*) d_masks, (void*) &tensor.masks[0], sizeof(uint32_t)*numBBoxes, cudaMemcpyHostToDevice);
++
++    float* d_anchors;
++    cudaMalloc((void**) &d_anchors, sizeof(float)*tensor.anchors.size());
++    cudaMemcpy((void*) d_anchors, (void*) &tensor.anchors[0], sizeof(float)*tensor.anchors.size(), cudaMemcpyHostToDevice);    
++
++    float* d_boxes;
++    cudaMalloc((void**) &d_boxes, boxes_bytes);
++
++    // CUDA Grid and Block
++    dim3 threads_per_block(20, 20);
++    dim3 number_of_blocks((tensor.grid_w / threads_per_block.x) + 1, (tensor.grid_h / threads_per_block.y) + 1);
++
++    // start kernel   
++    decodeTensorKernel<<<number_of_blocks, threads_per_block>>>(d_detections, d_masks, d_anchors, d_boxes, grid_h, grid_w, numClasses, numBBoxes);
++
++    // asynchronous copy
++    cudaMemcpyAsync((void*) boxes, (void*) d_boxes, boxes_bytes, cudaMemcpyDeviceToHost); 
++    
++    // wait for kernel
++    cudaDeviceSynchronize();
++    
++    // free memory
++    cudaFree(d_detections);
++    cudaFree(d_masks);
++    cudaFree(d_anchors);
++    cudaFree(d_boxes);
++    
++    // decode results
++    return boxes;	
++}
+diff --git a/modules/decodeTensorCUDA.h b/modules/decodeTensorCUDA.h
+new file mode 100755
+index 0000000..67bbec7
+--- /dev/null
++++ b/modules/decodeTensorCUDA.h
+@@ -0,0 +1,6 @@
++#ifndef DECODETENSORCUDA_H_
++#define DECODETENSORCUDA_H_
++#include "yolo.h" 
++
++float* decodeTensorCUDA(const int imageIdx, const TensorInfo& tensor);
++#endif
+\ No newline at end of file
+diff --git a/modules/detect.cu b/modules/detect.cu
+index 4d8f20e..f97c22e 100644
+--- a/modules/detect.cu
++++ b/modules/detect.cu
+@@ -122,20 +122,34 @@ namespace nvinfer1
+ 		return cudaGetLastError();
+ 	}
+ 
+-	int Detect::enqueue(int batchSize, const void* const* inputs, void** outputs, void* workspace,
+-		cudaStream_t stream)
++	int Detect::enqueue(int batchSize,
++		const void* const* inputs,
++		void* const* outputs,
++		void* workspace,
++		cudaStream_t stream) noexcept
+ 	{
+ 		NV_CUDA_CHECK(cuda_detect_layer(inputs[0], outputs[0], batchSize, _n_grid_h, _n_grid_w, _n_classes, _n_anchor, _n_output_size, stream));
+ 		return 0;
+ 	}
+ 
+-	size_t Detect::getSerializationSize() const
++
++	bool Detect::supportsFormat(DataType type, PluginFormat format) const noexcept
++	{
++		return (type == DataType::kFLOAT && format == PluginFormat::kLINEAR);
++	}
++
++	void Detect::configureWithFormat(const Dims* inputDims, int nbInputs, const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept
++	{
++
++	}
++
++	size_t Detect::getSerializationSize() const noexcept
+ 	{
+ 		return sizeof(_n_anchor) + sizeof(_n_classes) + sizeof(_n_grid_h) + sizeof(_n_grid_w)
+ 			+ sizeof(_n_output_size);
+ 	}
+ 
+-	void Detect::serialize(void *buffer) const
++	void Detect::serialize(void *buffer) const noexcept
+ 	{
+ 		char *d = static_cast<char*>(buffer), *a = d;
+ 		write(d,_n_anchor);
+@@ -150,7 +164,7 @@ namespace nvinfer1
+ 	{
+ 
+ 	}
+-	IPluginV2IOExt* Detect::clone() const
++	IPluginV2* Detect::clone() const noexcept
+ 	{
+ 		Detect *p = new Detect(_n_anchor,_n_classes,_n_grid_h,_n_grid_w);
+ 		p->setPluginNamespace(_s_plugin_namespace.c_str());
+@@ -169,41 +183,41 @@ namespace nvinfer1
+ 		_fc.fields = _vec_plugin_attributes.data();
+ 	}
+ 
+-	const char* DetectPluginCreator::getPluginName() const
++	const char* DetectPluginCreator::getPluginName() const noexcept
+ 	{
+ 		return "DETECT_TRT";
+ 	}
+ 
+-	const char* DetectPluginCreator::getPluginVersion() const
++	const char* DetectPluginCreator::getPluginVersion() const noexcept
+ 	{
+ 		return "1.0";
+ 	}
+ 
+-	const PluginFieldCollection* DetectPluginCreator::getFieldNames()
++	const PluginFieldCollection* DetectPluginCreator::getFieldNames() noexcept
+ 	{
+ 		return &_fc;
+ 	}
+ 
+-	IPluginV2IOExt* DetectPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc)
++	IPluginV2* DetectPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+ 	{
+ 		Detect* obj = new Detect();
+ 		obj->setPluginNamespace(_s_name_space.c_str());
+ 		return obj;
+ 	}
+ 
+-	IPluginV2IOExt* DetectPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength)
++	IPluginV2* DetectPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength) noexcept
+ 	{
+ 		Detect* obj = new Detect(serialData, serialLength);
+ 		obj->setPluginNamespace(_s_name_space.c_str());
+ 		return obj;
+ 	}
+ 
+-	void DetectPluginCreator::setPluginNamespace(const char* libNamespace)
++	void DetectPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
+ 	{
+ 		_s_name_space = libNamespace;
+ 	}
+ 
+-	const char* DetectPluginCreator::getPluginNamespace() const
++	const char* DetectPluginCreator::getPluginNamespace() const noexcept
+ 	{
+ 		return _s_name_space.c_str();
+ 	}
+diff --git a/modules/detect.h b/modules/detect.h
+index 7eff6c0..15a6e18 100644
+--- a/modules/detect.h
++++ b/modules/detect.h
+@@ -21,7 +21,7 @@ namespace nvinfer1
+ 		buffer += sizeof(T);
+ 	}
+ 
+-	class Detect :public IPluginV2IOExt
++	class Detect :public IPluginV2
+ 	{
+ 	public:
+ 		Detect();
+@@ -30,71 +30,76 @@ namespace nvinfer1
+ 			const uint32_t n_grid_h_, const uint32_t n_grid_w_/*,
+ 			const uint32_t &n_stride_h_, const uint32_t &n_stride_w_*/);
+ 		~Detect();
+-		int getNbOutputs()const override
++		int getNbOutputs()const noexcept override
+ 		{
+ 			return 1;
+ 		}
+-		Dims getOutputDimensions(int index, const Dims* inputs, int nbInputDims) override
++		Dims getOutputDimensions(int index, const Dims* inputs, int nbInputDims) noexcept  override
+ 		{
+ 			return inputs[0];
+ 		}
+-		int initialize() override
++		int initialize() noexcept  override
+ 		{
+ 			return 0;
+ 		}
+-		void terminate() override
++		void terminate() noexcept  override
+ 		{
+ 		}
+-		size_t getWorkspaceSize(int maxBatchSize) const override
++		size_t getWorkspaceSize(int maxBatchSize) const noexcept  override
+ 		{
+ 			return 0;
+ 		}
+-		int enqueue(int batchSize, const void* const* inputs, void** outputs, void* workspace, cudaStream_t stream)override;
+-		size_t getSerializationSize() const override;
+-		void serialize(void* buffer) const override;
+-		const char* getPluginType() const override
++		int enqueue(int batchSize, const void* const* inputs, void* const* outputs, void* workspace,
++			cudaStream_t stream) noexcept override;
++
++		bool supportsFormat(DataType type, PluginFormat format) const noexcept override;
++		void configureWithFormat(const Dims* inputDims, int nbInputs, const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept override;
++
++		size_t getSerializationSize() const noexcept  override;
++		void serialize(void* buffer) const noexcept  override;
++		const char* getPluginType() const noexcept  override
+ 		{
+ 			return "DETECT_TRT";
+ 		}
+-		const char* getPluginVersion() const override
++		const char* getPluginVersion() const noexcept  override
+ 		{
+ 			return "1.0";
+ 		}
+-		void destroy() override
++		void destroy() noexcept  override
+ 		{
+ 			delete this;
+ 		}
+-		void setPluginNamespace(const char* pluginNamespace) override
++		void setPluginNamespace(const char* pluginNamespace) noexcept  override
+ 		{
+ 			_s_plugin_namespace = pluginNamespace;
+ 		}
+-		const char* getPluginNamespace() const override
++		const char* getPluginNamespace() const  noexcept override
+ 		{
+ 			return _s_plugin_namespace.c_str();
+ 		}
+-		DataType getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const override
++		DataType getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+ 		{
+ 			return DataType::kFLOAT;
+ 		}
+-		bool isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const override
++		bool isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const noexcept
+ 		{
+ 			return false;
+ 		}
+-		bool canBroadcastInputAcrossBatch(int inputIndex) const override
++		bool canBroadcastInputAcrossBatch(int inputIndex) const noexcept
+ 		{
+ 			return false;
+ 		}
+ 		void attachToContext(
+-			cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator) override
++			cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator)
+ 		{}
+-		void configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput) override;
+-		void detachFromContext() override
++		void configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput) ;
++		void detachFromContext()
+ 		{}
+-		bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) const override
++		bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) const noexcept
+ 		{
+ 			return inOut[pos].format == TensorFormat::kLINEAR && inOut[pos].type == DataType::kFLOAT;
+ 		}
+-		IPluginV2IOExt* clone() const override;
++		IPluginV2* clone() const noexcept override;
+ 	private:
+ 		
+ 		uint32_t _n_anchor;
+@@ -112,13 +117,13 @@ namespace nvinfer1
+ 	public:
+ 		DetectPluginCreator();
+ 		~DetectPluginCreator() override = default;
+-		const char* getPluginName()const override;
+-		const char* getPluginVersion() const override;
+-		const PluginFieldCollection* getFieldNames() override;
+-		IPluginV2IOExt* createPlugin(const char* name, const PluginFieldCollection* fc) override;
+-		IPluginV2IOExt* deserializePlugin(const char* name, const void* serialData, size_t serialLength) override;
+-		void setPluginNamespace(const char* libNamespace) override;
+-		const char* getPluginNamespace() const override;
++		const char* getPluginName()const noexcept  override;
++		const char* getPluginVersion() const  noexcept override;
++		const PluginFieldCollection* getFieldNames() noexcept  override;
++		IPluginV2* createPlugin(const char* name, const PluginFieldCollection* fc) noexcept  override;
++		IPluginV2* deserializePlugin(const char* name, const void* serialData, size_t serialLength) noexcept  override;
++		void setPluginNamespace(const char* libNamespace)  noexcept override;
++		const char* getPluginNamespace() const noexcept  override;
+ 	private:
+ 		std::string _s_name_space;
+ 		static PluginFieldCollection _fc;
+diff --git a/modules/ds_image.cpp b/modules/ds_image.cpp
+index 35f39ee..6441a44 100644
+--- a/modules/ds_image.cpp
++++ b/modules/ds_image.cpp
+@@ -61,11 +61,9 @@ DsImage::DsImage(const cv::Mat& mat_image_, const std::string &s_net_type_, cons
+ 	if ("yolov5" == s_net_type_)
+ 	{
+ 		// resize the DsImage with scale
+-		float dim = std::max(m_Height, m_Width);
+-		int resizeH = ((m_Height / dim) * inputH);
+-		int resizeW = ((m_Width / dim) * inputW);
+-		m_ScalingFactor = static_cast<float>(resizeH) / static_cast<float>(m_Height);
+-		float	m_ScalingFactorw = static_cast<float>(resizeW) / static_cast<float>(m_Width);
++		float r = std::min(static_cast<float>(inputH) / static_cast<float>(m_Height), static_cast<float>(inputW) / static_cast<float>(m_Width));
++        int resizeH = (std::round(m_Height*r));
++        int resizeW = (std::round(m_Width*r));
+ 
+ 		// Additional checks for images with non even dims
+ 		if ((inputW - resizeW) % 2) resizeW--;
+diff --git a/modules/hardswish.cu b/modules/hardswish.cu
+index fe5dc31..43eac03 100644
+--- a/modules/hardswish.cu
++++ b/modules/hardswish.cu
+@@ -69,27 +69,30 @@ namespace nvinfer1
+ 	{
+ 		int n_data_size = n_batch_size_ * n_output_size_;
+ //		printf("cuda_hardswish_layer:%d,size:%d\n", n_batch_size_, n_output_size_);
+-		kernel_hardswish << <(n_data_size + threads_ -1)/threads_, threads_ >> >(
++		kernel_hardswish << <(n_data_size + threads_ -1)/threads_, threads_, 0, stream_ >> >(
+ 				reinterpret_cast<const float*>(input_),
+ 				reinterpret_cast<float*>(output_),
+ 				n_data_size);
+ 		return cudaGetLastError();
+ 	}
+ 
+-	int Hardswish::enqueue(int batchSize, const void* const* inputs, void** outputs, void* workspace,
+-		cudaStream_t stream)
++	int Hardswish::enqueue(int batchSize,
++		const void* const* inputs,
++		void* const* outputs,
++		void* workspace,
++		cudaStream_t stream) noexcept
+ 	{
+ //		printf("batch_size:%d,output_size:%d,threads:%d\n", batchSize, _n_output_size, _n_max_thread_pre_block);
+-		NV_CUDA_CHECK(cuda_hardswish_layer(inputs[0], outputs[0], batchSize, _n_output_size , _n_max_thread_pre_block,stream));
++		NV_CUDA_CHECK(cuda_hardswish_layer(inputs[0], outputs[0], batchSize, _n_output_size , _n_max_thread_pre_block, stream));
+ 		return 0;
+ 	}
+ 
+-	size_t Hardswish::getSerializationSize() const
++	size_t Hardswish::getSerializationSize() const noexcept
+ 	{
+ 		return sizeof(_n_max_thread_pre_block) +sizeof(_n_output_size);
+ 	}
+ 
+-	void Hardswish::serialize(void *buffer) const
++	void Hardswish::serialize(void *buffer) const noexcept
+ 	{
+ 		char *d = static_cast<char*>(buffer), *a = d;
+ 		w(d, _n_max_thread_pre_block);
+@@ -98,13 +101,26 @@ namespace nvinfer1
+ 		assert(d == a + getSerializationSize());
+ 	}
+ 
+-	void Hardswish::configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput)
++
++	bool Hardswish::supportsFormat(DataType type, PluginFormat format) const noexcept
++	{
++		return (type == DataType::kFLOAT && format == PluginFormat::kLINEAR);
++	}
++
++	void Hardswish::configureWithFormat(const Dims* inputDims, int nbInputs,
++		const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept
++	{
++	
++	}
++
++
++	void Hardswish::configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput) noexcept
+ 	{
+ 		
+ 		_n_output_size = in->dims.d[0] * in->dims.d[1] * in->dims.d[2];
+ //		printf("configurePlugin:%d,%d,%d\n", in->dims.d[0], in->dims.d[1], in->dims.d[2]);
+ 	}
+-	IPluginV2IOExt* Hardswish::clone() const
++	IPluginV2* Hardswish::clone() const noexcept
+ 	{
+ 		Hardswish *p = new Hardswish();
+ 		p->setPluginNamespace(_s_plugin_namespace.c_str());
+@@ -126,41 +142,41 @@ namespace nvinfer1
+ 		_fc.fields = _vec_plugin_attributes.data();
+ 	}
+ 
+-	const char* HardswishPluginCreator::getPluginName() const
++	const char* HardswishPluginCreator::getPluginName() const noexcept
+ 	{
+ 		return "HARDSWISH_TRT";
+ 	}
+ 
+-	const char* HardswishPluginCreator::getPluginVersion() const
++	const char* HardswishPluginCreator::getPluginVersion() const noexcept
+ 	{
+ 		return "1.0";
+ 	}
+ 
+-	const PluginFieldCollection* HardswishPluginCreator::getFieldNames()
++	const PluginFieldCollection* HardswishPluginCreator::getFieldNames() noexcept
+ 	{
+ 		return &_fc;
+ 	}
+ 
+-	IPluginV2IOExt* HardswishPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc)
++	IPluginV2* HardswishPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+ 	{
+ 		Hardswish* obj = new Hardswish();
+ 		obj->setPluginNamespace(_s_name_space.c_str());
+ 		return obj;
+ 	}
+ 
+-	IPluginV2IOExt* HardswishPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength)
++	IPluginV2* HardswishPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength) noexcept
+ 	{
+ 		Hardswish* obj = new Hardswish(serialData, serialLength);
+ 		obj->setPluginNamespace(_s_name_space.c_str());
+ 		return obj;
+ 	}
+ 
+-	void HardswishPluginCreator::setPluginNamespace(const char* libNamespace)
++	void HardswishPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
+ 	{
+ 		_s_name_space = libNamespace;
+ 	}
+ 
+-	const char* HardswishPluginCreator::getPluginNamespace() const
++	const char* HardswishPluginCreator::getPluginNamespace() const noexcept
+ 	{
+ 		return _s_name_space.c_str();
+ 	}
+diff --git a/modules/hardswish.h b/modules/hardswish.h
+index 4cd824e..be4133b 100644
+--- a/modules/hardswish.h
++++ b/modules/hardswish.h
+@@ -22,77 +22,83 @@ namespace nvinfer1
+ 		buffer += sizeof(T);
+ 	}
+ 
+-	class Hardswish :public IPluginV2IOExt
++	class Hardswish :public IPluginV2
+ 	{
+ 	public:
+ 		Hardswish();
+ 		Hardswish(const void* data, size_t length);
+ 		~Hardswish();
+-		int getNbOutputs()const override
++		int getNbOutputs()const noexcept  override
+ 		{
+ 			return 1;
+ 		}
+-		Dims getOutputDimensions(int index, const Dims* inputs, int nbInputDims) override
++		Dims getOutputDimensions(int index, const Dims* inputs, int nbInputDims) noexcept  override
+ 		{
+ 			return inputs[0];
+ 		}
+-		int initialize() override
++		int initialize() noexcept  override
+ 		{
+ 			return 0;
+ 		}
+-		void terminate() override
++		void terminate() noexcept  override
+ 		{
+ 		}
+-		size_t getWorkspaceSize(int maxBatchSize) const override
++		size_t getWorkspaceSize(int maxBatchSize) const noexcept  override
+ 		{
+ 			return 0;
+ 		}
+-		int enqueue(int batchSize, const void* const* inputs, void** outputs, void* workspace, cudaStream_t stream)override;
+-		size_t getSerializationSize() const override;
+-		void serialize(void* buffer) const override;
+-		const char* getPluginType() const override
++
++		bool supportsFormat(DataType type, PluginFormat format) const noexcept override;
++		void configureWithFormat(const Dims* inputDims, int nbInputs, const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept override;
++
++		int enqueue(int batchSize, const void* const* inputs, void* const* outputs, void* workspace,
++			cudaStream_t stream) noexcept override;
++
++		size_t getSerializationSize() const noexcept  override;
++		void serialize(void* buffer) const noexcept  override;
++		const char* getPluginType() const noexcept  override
+ 		{
+ 			return "HARDSWISH_TRT";
+ 		}
+-		const char* getPluginVersion() const override
++		const char* getPluginVersion() const noexcept  override
+ 		{
+ 			return "1.0";
+ 		}
+-		void destroy() override
++		void destroy() noexcept  override
+ 		{
+ 			delete this;
+ 		}
+-		void setPluginNamespace(const char* pluginNamespace) override
++		void setPluginNamespace(const char* pluginNamespace) noexcept  override
+ 		{
+ 			_s_plugin_namespace = pluginNamespace;
+ 		}
+-		const char* getPluginNamespace() const override
++		const char* getPluginNamespace() const noexcept  override
+ 		{
+ 			return _s_plugin_namespace.c_str();
+ 		}
+-		DataType getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const override
++		DataType getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+ 		{
+ 			return DataType::kFLOAT;
+ 		}
+-		bool isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const override
++		bool isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const noexcept
+ 		{
+ 			return false;
+ 		}
+-		bool canBroadcastInputAcrossBatch(int inputIndex) const override
++		bool canBroadcastInputAcrossBatch(int inputIndex) const noexcept
+ 		{
+ 			return false;
+ 		}
+ 		void attachToContext(
+-			cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator) override
++			cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator) noexcept
+ 		{}
+-		void configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput) override;
+-		void detachFromContext() override
++		void configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput) noexcept;
++		void detachFromContext()  noexcept
+ 		{}
+-		bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) const override
++		bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) const noexcept
+ 		{
+ 			return inOut[pos].format == TensorFormat::kLINEAR && inOut[pos].type == DataType::kFLOAT;
+ 		}
+-		IPluginV2IOExt* clone() const override;
++		IPluginV2* clone() const  noexcept override;
+ 	private:
+ 
+ 		uint32_t _n_max_thread_pre_block;
+@@ -105,13 +111,13 @@ namespace nvinfer1
+ 	public:
+ 		HardswishPluginCreator();
+ 		~HardswishPluginCreator() override = default;
+-		const char* getPluginName()const override;
+-		const char* getPluginVersion() const override;
+-		const PluginFieldCollection* getFieldNames() override;
+-		IPluginV2IOExt* createPlugin(const char* name, const PluginFieldCollection* fc) override;
+-		IPluginV2IOExt* deserializePlugin(const char* name, const void* serialData, size_t serialLength) override;
+-		void setPluginNamespace(const char* libNamespace) override;
+-		const char* getPluginNamespace() const override;
++		const char* getPluginName()const noexcept  override;
++		const char* getPluginVersion() const  noexcept override;
++		const PluginFieldCollection* getFieldNames() noexcept  override;
++		IPluginV2* createPlugin(const char* name, const PluginFieldCollection* fc) noexcept  override;
++		IPluginV2* deserializePlugin(const char* name, const void* serialData, size_t serialLength) noexcept  override;
++		void setPluginNamespace(const char* libNamespace) noexcept  override;
++		const char* getPluginNamespace() const noexcept  override;
+ 	private:
+ 		std::string _s_name_space;
+ 		static PluginFieldCollection _fc;
+diff --git a/modules/mish.cu b/modules/mish.cu
+index d05f609..6ae291d 100644
+--- a/modules/mish.cu
++++ b/modules/mish.cu
+@@ -21,22 +21,33 @@ namespace nvinfer1
+         input_size_ = *reinterpret_cast<const int*>(data);
+     }
+ 
+-    void MishPlugin::serialize(void* buffer) const
++    void MishPlugin::serialize(void* buffer) const noexcept
+     {
+         *reinterpret_cast<int*>(buffer) = input_size_;
+     }
+ 
+-    size_t MishPlugin::getSerializationSize() const
++    size_t MishPlugin::getSerializationSize() const noexcept
+     {  
+         return sizeof(input_size_);
+     }
+ 
+-    int MishPlugin::initialize()
++    int MishPlugin::initialize()noexcept
+     { 
+         return 0;
+     }
+ 
+-    Dims MishPlugin::getOutputDimensions(int index, const Dims* inputs, int nbInputDims)
++	bool MishPlugin::supportsFormat(DataType type, PluginFormat format) const noexcept
++	{
++		return (type == DataType::kFLOAT && format == PluginFormat::kLINEAR);
++	}
++
++	void MishPlugin::configureWithFormat(const Dims* inputDims, int nbInputs,
++		const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept
++	{
++
++	}
++
++    Dims MishPlugin::getOutputDimensions(int index, const Dims* inputs, int nbInputDims)noexcept
+     {
+         assert(nbInputDims == 1);
+         assert(index == 0);
+@@ -46,63 +57,63 @@ namespace nvinfer1
+     }
+ 
+     // Set plugin namespace
+-    void MishPlugin::setPluginNamespace(const char* pluginNamespace)
++    void MishPlugin::setPluginNamespace(const char* pluginNamespace)noexcept
+     {
+         mPluginNamespace = pluginNamespace;
+     }
+ 
+-    const char* MishPlugin::getPluginNamespace() const
++    const char* MishPlugin::getPluginNamespace() const noexcept
+     {
+         return mPluginNamespace;
+     }
+ 
+     // Return the DataType of the plugin output at the requested index
+-    DataType MishPlugin::getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const
++    DataType MishPlugin::getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
+     {
+         return DataType::kFLOAT;
+     }
+ 
+     // Return true if output tensor is broadcast across a batch.
+-    bool MishPlugin::isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const
++    bool MishPlugin::isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const noexcept
+     {
+         return false;
+     }
+ 
+     // Return true if plugin can use input that is broadcast across batch without replication.
+-    bool MishPlugin::canBroadcastInputAcrossBatch(int inputIndex) const
++    bool MishPlugin::canBroadcastInputAcrossBatch(int inputIndex) const noexcept
+     {
+         return false;
+     }
+ 
+-    void MishPlugin::configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput)
++    void MishPlugin::configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput)noexcept
+     {
+     }
+ 
+     // Attach the plugin object to an execution context and grant the plugin the access to some context resource.
+-    void MishPlugin::attachToContext(cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator)
++    void MishPlugin::attachToContext(cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator)noexcept
+     {
+     }
+ 
+     // Detach the plugin object from its execution context.
+-    void MishPlugin::detachFromContext() {}
++    void MishPlugin::detachFromContext()noexcept {}
+ 
+-    const char* MishPlugin::getPluginType() const
++    const char* MishPlugin::getPluginType() const noexcept
+     {
+         return "Mish_TRT";
+     }
+ 
+-    const char* MishPlugin::getPluginVersion() const
++    const char* MishPlugin::getPluginVersion() const noexcept
+     {
+         return "1";
+     }
+ 
+-    void MishPlugin::destroy()
++    void MishPlugin::destroy()noexcept
+     {
+         delete this;
+     }
+ 
+     // Clone the plugin
+-    IPluginV2IOExt* MishPlugin::clone() const
++    IPluginV2* MishPlugin::clone() const noexcept
+     {
+         MishPlugin *p = new MishPlugin();
+         p->input_size_ = input_size_;
+@@ -112,13 +123,15 @@ namespace nvinfer1
+ 
+     __device__ float tanh_activate_kernel(float x){return (2/(1 + expf(-2*x)) - 1);}
+ 
+-    __device__ float softplus_kernel(float x, float threshold = 20) {
++    __device__ float softplus_kernel(float x, float threshold = 20) 
++	{
+         if (x > threshold) return x;                // too large
+         else if (x < -threshold) return expf(x);    // too small
+         return logf(expf(x) + 1);
+     }
+ 
+-    __global__ void mish_kernel(const float *input, float *output, int num_elem) {
++    __global__ void mish_kernel(const float *input, float *output, int num_elem) 
++	{
+ 
+         int idx = threadIdx.x + blockDim.x * blockIdx.x;
+         if (idx >= num_elem) return;
+@@ -135,14 +148,19 @@ namespace nvinfer1
+         output[idx] = input[idx] * tanh_activate_kernel(softplus_kernel(input[idx]));
+     }
+ 
+-    void MishPlugin::forwardGpu(const float *const * inputs, float* output, cudaStream_t stream, int batchSize) {
++    void MishPlugin::forwardGpu(const float *const * inputs, float* output, cudaStream_t stream, int batchSize)
++	{
+         int block_size = thread_count_;
+         int grid_size = (input_size_ * batchSize + block_size - 1) / block_size;
+-        mish_kernel<<<grid_size, block_size>>>(inputs[0], output, input_size_ * batchSize);
++        mish_kernel<<<grid_size, block_size, 0, stream>>>(inputs[0], output, input_size_ * batchSize);
+     }
+ 
+-    int MishPlugin::enqueue(int batchSize, const void*const * inputs, void** outputs, void* workspace, cudaStream_t stream)
+-    {
++	int MishPlugin::enqueue(int batchSize,
++		const void* const* inputs,
++		void* const* outputs,
++		void* workspace,
++		cudaStream_t stream) noexcept 
++	{
+         //assert(batchSize == 1);
+         //GPU
+         //CUDA_CHECK(cudaStreamSynchronize(stream));
+@@ -161,29 +179,29 @@ namespace nvinfer1
+         mFC.fields = mPluginAttributes.data();
+     }
+ 
+-    const char* MishPluginCreator::getPluginName() const
++    const char* MishPluginCreator::getPluginName() const noexcept
+     {
+             return "Mish_TRT";
+     }
+ 
+-    const char* MishPluginCreator::getPluginVersion() const
++    const char* MishPluginCreator::getPluginVersion() const noexcept
+     {
+             return "1";
+     }
+ 
+-    const PluginFieldCollection* MishPluginCreator::getFieldNames()
++    const PluginFieldCollection* MishPluginCreator::getFieldNames()noexcept
+     {
+             return &mFC;
+     }
+ 
+-    IPluginV2IOExt* MishPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc)
++    IPluginV2* MishPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc)noexcept
+     {
+         MishPlugin* obj = new MishPlugin();
+         obj->setPluginNamespace(mNamespace.c_str());
+         return obj;
+     }
+ 
+-    IPluginV2IOExt* MishPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength)
++    IPluginV2* MishPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength)noexcept
+     {
+         // This object will be deleted when the network is destroyed, which will
+         // call MishPlugin::destroy()
+@@ -192,5 +210,17 @@ namespace nvinfer1
+         return obj;
+     }
+ 
++
++	void MishPluginCreator::setPluginNamespace(const char* libNamespace)noexcept
++	{
++		mNamespace = libNamespace;
++	}
++
++	const char* MishPluginCreator::getPluginNamespace() const noexcept
++	{
++		return mNamespace.c_str();
++	}
++
++
+ }
+ 
+diff --git a/modules/mish.h b/modules/mish.h
+index bae6f1f..b5d9791 100644
+--- a/modules/mish.h
++++ b/modules/mish.h
+@@ -9,7 +9,7 @@
+ //https://github.com/wang-xinyu/tensorrtx
+ namespace nvinfer1
+ {
+-    class MishPlugin: public IPluginV2IOExt
++    class MishPlugin: public IPluginV2
+     {
+         public:
+             explicit MishPlugin();
+@@ -17,53 +17,57 @@ namespace nvinfer1
+ 
+             ~MishPlugin();
+ 
+-            int getNbOutputs() const override
++            int getNbOutputs() const  noexcept override
+             {
+                 return 1;
+             }
+ 
+-            Dims getOutputDimensions(int index, const Dims* inputs, int nbInputDims) override;
++            Dims getOutputDimensions(int index, const Dims* inputs, int nbInputDims) noexcept  override;
+ 
+-            int initialize() override;
++            int initialize() noexcept  override;
+ 
+-            virtual void terminate() override {}
++            virtual void terminate() noexcept  override {}
+ 
+-            virtual size_t getWorkspaceSize(int maxBatchSize) const override { return 0;}
++            virtual size_t getWorkspaceSize(int maxBatchSize) const noexcept  override { return 0;}
+ 
+-            virtual int enqueue(int batchSize, const void*const * inputs, void** outputs, void* workspace, cudaStream_t stream) override;
++         //   virtual int enqueue(int batchSize, const void*const * inputs, void** outputs, void* workspace, cudaStream_t stream);
++			int enqueue(int batchSize, const void* const* inputs, void* const* outputs, void* workspace,
++				cudaStream_t stream) noexcept override;
++			bool supportsFormat(DataType type, PluginFormat format) const noexcept override;
++			void configureWithFormat(const Dims* inputDims, int nbInputs, const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept override;
+ 
+-            virtual size_t getSerializationSize() const override;
++            virtual size_t getSerializationSize() const noexcept  override;
+ 
+-            virtual void serialize(void* buffer) const override;
++            virtual void serialize(void* buffer) const noexcept  override;
+ 
+-            bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) const override {
++            bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) const noexcept {
+                 return inOut[pos].format == TensorFormat::kLINEAR && inOut[pos].type == DataType::kFLOAT;
+             }
+ 
+-            const char* getPluginType() const override;
++            const char* getPluginType() const noexcept  override;
+ 
+-            const char* getPluginVersion() const override;
++            const char* getPluginVersion() const noexcept  override;
+ 
+-            void destroy() override;
++            void destroy()  noexcept override;
+ 
+-            IPluginV2IOExt* clone() const override;
++            IPluginV2* clone() const noexcept  override;
+ 
+-            void setPluginNamespace(const char* pluginNamespace) override;
++            void setPluginNamespace(const char* pluginNamespace) noexcept  override;
+ 
+-            const char* getPluginNamespace() const override;
++            const char* getPluginNamespace() const  noexcept override;
+ 
+-            DataType getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const override;
++            DataType getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept;
+ 
+-            bool isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const override;
++            bool isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const noexcept;
+ 
+-            bool canBroadcastInputAcrossBatch(int inputIndex) const override;
++            bool canBroadcastInputAcrossBatch(int inputIndex) const noexcept;
+ 
+             void attachToContext(
+-                    cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator) override;
++                    cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator)noexcept;
+ 
+-            void configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput) override;
++            void configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput)noexcept;
+ 
+-            void detachFromContext() override;
++            void detachFromContext()noexcept;
+ 
+             int input_size_;
+         private:
+@@ -79,25 +83,19 @@ namespace nvinfer1
+ 
+             ~MishPluginCreator() override = default;
+ 
+-            const char* getPluginName() const override;
++            const char* getPluginName() const noexcept  override;
+ 
+-            const char* getPluginVersion() const override;
++            const char* getPluginVersion() const  noexcept override;
+ 
+-            const PluginFieldCollection* getFieldNames() override;
++            const PluginFieldCollection* getFieldNames() noexcept  override;
+ 
+-            IPluginV2IOExt* createPlugin(const char* name, const PluginFieldCollection* fc) override;
++            IPluginV2* createPlugin(const char* name, const PluginFieldCollection* fc)  noexcept override;
+ 
+-            IPluginV2IOExt* deserializePlugin(const char* name, const void* serialData, size_t serialLength) override;
++            IPluginV2* deserializePlugin(const char* name, const void* serialData, size_t serialLength) noexcept  override;
+ 
+-            void setPluginNamespace(const char* libNamespace) override
+-            {
+-                mNamespace = libNamespace;
+-            }
++			void setPluginNamespace(const char* libNamespace) noexcept  override;
+ 
+-            const char* getPluginNamespace() const override
+-            {
+-                return mNamespace.c_str();
+-            }
++			const char* getPluginNamespace() const noexcept  override;
+ 
+         private:
+             std::string mNamespace;
+diff --git a/modules/plugin_factory.cpp b/modules/plugin_factory.cpp
+index 3e2209a..a9754b9 100644
+--- a/modules/plugin_factory.cpp
++++ b/modules/plugin_factory.cpp
+@@ -1,176 +1,239 @@
+-/**
+-MIT License
+-
+-Copyright (c) 2018 NVIDIA CORPORATION. All rights reserved.
+-
+-Permission is hereby granted, free of charge, to any person obtaining a copy
+-of this software and associated documentation files (the "Software"), to deal
+-in the Software without restriction, including without limitation the rights
+-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-copies of the Software, and to permit persons to whom the Software is
+-furnished to do so, subject to the following conditions:
+-
+-The above copyright notice and this permission notice shall be included in all
+-copies or substantial portions of the Software.
+-
+-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+-SOFTWARE.
+-*
+-*/
++
+ 
+ #include "plugin_factory.h"
+ #include "trt_utils.h"
+ 
+-PluginFactory::PluginFactory() : m_ReorgLayer{nullptr}, m_RegionLayer{nullptr}
+-{
+-    for (int i = 0; i < m_MaxLeakyLayers; ++i) m_LeakyReLULayers[i] = nullptr;
+-}
+-
+-nvinfer1::IPlugin* PluginFactory::createPlugin(const char* layerName, const void* serialData,
+-                                               size_t serialLength)
+-{
+-    assert(isPlugin(layerName));
+-    if (std::string(layerName).find("leaky") != std::string::npos)
+-    {
+-        assert(m_LeakyReLUCount >= 0 && m_LeakyReLUCount <= m_MaxLeakyLayers);
+-        assert(m_LeakyReLULayers[m_LeakyReLUCount] == nullptr);
+-		/*m_LeakyReLULayers[m_LeakyReLUCount]
+-			= unique_ptr_INvPlugin(nvinfer1::plugin::createPReLUPlugin(serialData, serialLength));*/
+-        ++m_LeakyReLUCount;
+-        return m_LeakyReLULayers[m_LeakyReLUCount - 1].get();
+-    }
+-    else if (std::string(layerName).find("reorg") != std::string::npos)
+-    {
+-        assert(m_ReorgLayer == nullptr);
+-        /*m_ReorgLayer = unique_ptr_INvPlugin(
+-            nvinfer1::plugin::createYOLOReorgPlugin(serialData, serialLength));*/
+-        return m_ReorgLayer.get();
+-    }
+-    else if (std::string(layerName).find("region") != std::string::npos)
+-    {
+-        assert(m_RegionLayer == nullptr);
+-		/*m_RegionLayer = unique_ptr_INvPlugin(
+-			 nvinfer1::plugin::createYOLORegionPlugin(serialData, serialLength));*/
+-        return m_RegionLayer.get();
+-    }
+-    else if (std::string(layerName).find("yolo") != std::string::npos)
+-    {
+-        assert(m_YoloLayerCount >= 0 && m_YoloLayerCount < m_MaxYoloLayers);
+-        assert(m_YoloLayers[m_YoloLayerCount] == nullptr);
+-        m_YoloLayers[m_YoloLayerCount]
+-            = unique_ptr_IPlugin(new YoloLayerV3(serialData, serialLength));
+-        ++m_YoloLayerCount;
+-        return m_YoloLayers[m_YoloLayerCount - 1].get();
+-    }
+-    else
+-    {
+-        std::cerr << "ERROR: Unrecognised layer : " << layerName << std::endl;
+-        assert(0);
+-        return nullptr;
+-    }
+-}
+-
+-bool PluginFactory::isPlugin(const char* name)
+-{
+-    return ((std::string(name).find("leaky") != std::string::npos)
+-            || (std::string(name).find("reorg") != std::string::npos)
+-            || (std::string(name).find("region") != std::string::npos)
+-            || (std::string(name).find("yolo") != std::string::npos));
+-}
+-
+-void PluginFactory::destroy()
+-{
+-    m_ReorgLayer.reset();
+-    m_RegionLayer.reset();
+-
+-    for (int i = 0; i < m_MaxLeakyLayers; ++i)
+-    {
+-        m_LeakyReLULayers[i].reset();
+-    }
+-
+-    for (int i = 0; i < m_MaxYoloLayers; ++i)
+-    {
+-        m_YoloLayers[i].reset();
+-    }
+-
+-    m_LeakyReLUCount = 0;
+-    m_YoloLayerCount = 0;
+-}
++//PluginFactory::PluginFactory() : m_ReorgLayer{nullptr}, m_RegionLayer{nullptr}
++//{
++//    for (int i = 0; i < m_MaxLeakyLayers; ++i) m_LeakyReLULayers[i] = nullptr;
++//}
++//
++//nvinfer1::IPlugin* PluginFactory::createPlugin(const char* layerName, const void* serialData,
++//                                               size_t serialLength)
++//{
++//    assert(isPlugin(layerName));
++//    if (std::string(layerName).find("leaky") != std::string::npos)
++//    {
++//        assert(m_LeakyReLUCount >= 0 && m_LeakyReLUCount <= m_MaxLeakyLayers);
++//        assert(m_LeakyReLULayers[m_LeakyReLUCount] == nullptr);
++//		/*m_LeakyReLULayers[m_LeakyReLUCount]
++//			= unique_ptr_INvPlugin(nvinfer1::plugin::createPReLUPlugin(serialData, serialLength));*/
++//        ++m_LeakyReLUCount;
++//        return m_LeakyReLULayers[m_LeakyReLUCount - 1].get();
++//    }
++//    else if (std::string(layerName).find("reorg") != std::string::npos)
++//    {
++//        assert(m_ReorgLayer == nullptr);
++//        /*m_ReorgLayer = unique_ptr_INvPlugin(
++//            nvinfer1::plugin::createYOLOReorgPlugin(serialData, serialLength));*/
++//        return m_ReorgLayer.get();
++//    }
++//    else if (std::string(layerName).find("region") != std::string::npos)
++//    {
++//        assert(m_RegionLayer == nullptr);
++//		/*m_RegionLayer = unique_ptr_INvPlugin(
++//			 nvinfer1::plugin::createYOLORegionPlugin(serialData, serialLength));*/
++//        return m_RegionLayer.get();
++//    }
++//    else if (std::string(layerName).find("yolo") != std::string::npos)
++//    {
++//        assert(m_YoloLayerCount >= 0 && m_YoloLayerCount < m_MaxYoloLayers);
++//        assert(m_YoloLayers[m_YoloLayerCount] == nullptr);
++//        m_YoloLayers[m_YoloLayerCount]
++//            = unique_ptr_IPlugin(new YoloLayerV3(serialData, serialLength));
++//        ++m_YoloLayerCount;
++//        return m_YoloLayers[m_YoloLayerCount - 1].get();
++//    }
++//    else
++//    {
++//        std::cerr << "ERROR: Unrecognised layer : " << layerName << std::endl;
++//        assert(0);
++//        return nullptr;
++//    }
++//}
++//
++//bool PluginFactory::isPlugin(const char* name)
++//{
++//    return ((std::string(name).find("leaky") != std::string::npos)
++//            || (std::string(name).find("reorg") != std::string::npos)
++//            || (std::string(name).find("region") != std::string::npos)
++//            || (std::string(name).find("yolo") != std::string::npos));
++//}
++//
++//void PluginFactory::destroy()
++//{
++//    m_ReorgLayer.reset();
++//    m_RegionLayer.reset();
++//
++//    for (int i = 0; i < m_MaxLeakyLayers; ++i)
++//    {
++//        m_LeakyReLULayers[i].reset();
++//    }
++//
++//    for (int i = 0; i < m_MaxYoloLayers; ++i)
++//    {
++//        m_YoloLayers[i].reset();
++//    }
++//
++//    m_LeakyReLUCount = 0;
++//    m_YoloLayerCount = 0;
++//}
+ 
+ /******* Yolo Layer V3 *******/
+ /*****************************/
+-YoloLayerV3::YoloLayerV3(const void* data, size_t length)
++namespace nvinfer1
+ {
+-    const char *d = static_cast<const char*>(data), *a = d;
+-    read(d, m_NumBoxes);
+-    read(d, m_NumClasses);
+-    read(d,_n_grid_h);
+-    read(d,_n_grid_w);
+-    read(d, m_OutputSize);
+-    assert(d = a + length);
+-}
++	YoloLayer::YoloLayer()
++	{}
++
++	YoloLayer::YoloLayer(const void* data, size_t length)
++	{
++		const char *d = static_cast<const char*>(data), *a = d;
++		re(d, m_NumBoxes);
++		re(d, m_NumClasses);
++		re(d, _n_grid_h);
++		re(d, _n_grid_w);
++		re(d, m_OutputSize);
++		assert(d = a + length);
++	}
++	void YoloLayer::serialize(void* buffer)const noexcept
++	{
++		char *d = static_cast<char*>(buffer), *a = d;
++		wr(d, m_NumBoxes);
++		wr(d, m_NumClasses);
++		wr(d, _n_grid_h);
++		wr(d, _n_grid_w);
++		wr(d, m_OutputSize);
++		assert(d == a + getSerializationSize());
++	}
++
++	bool YoloLayer::supportsFormat(DataType type, PluginFormat format) const noexcept
++	{
++		return (type == DataType::kFLOAT && format == PluginFormat::kLINEAR);
++	}
++
++	void YoloLayer::configureWithFormat(const Dims* inputDims, int nbInputs, const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept
++	{
++
++	}
++
++	IPluginV2* YoloLayer::clone() const noexcept
++	{
++		YoloLayer *p = new YoloLayer(m_NumBoxes,m_NumClasses,_n_grid_h,_n_grid_w);
++		p->setPluginNamespace(_s_plugin_namespace.c_str());
++		return p;
++	}
++
++	YoloLayer::YoloLayer(const uint32_t& numBoxes, const uint32_t& numClasses, const uint32_t& grid_h_, const uint32_t &grid_w_) :
++		m_NumBoxes(numBoxes),
++		m_NumClasses(numClasses),
++		_n_grid_h(grid_h_),
++		_n_grid_w(grid_w_)
++	{
++		assert(m_NumBoxes > 0);
++		assert(m_NumClasses > 0);
++		assert(_n_grid_h > 0);
++		assert(_n_grid_w > 0);
++		m_OutputSize = _n_grid_h * _n_grid_w * (m_NumBoxes * (4 + 1 + m_NumClasses));
++	}
++
++	int YoloLayer::getNbOutputs() const noexcept { return 1; }
++
++	nvinfer1::Dims YoloLayer::getOutputDimensions(int index, const nvinfer1::Dims* inputs,
++		int nbInputDims) noexcept
++	{
++		assert(index == 0);
++		assert(nbInputDims == 1);
++		return inputs[0];
++	}
++
++	//void YoloLayerV3::configure(const nvinfer1::Dims* inputDims, int nbInputs,
++	//                            const nvinfer1::Dims* outputDims, int nbOutputs, int maxBatchSize) noexcept
++	//{
++	//    assert(nbInputs == 1);
++	//    assert(inputDims != nullptr);
++	//}
++
++	int YoloLayer::initialize() noexcept { return 0; }
++
++	void YoloLayer::terminate() noexcept {}
++
++	size_t YoloLayer::getWorkspaceSize(int maxBatchSize) const noexcept
++	{
++		return 0;
++	}
++
++	int YoloLayer::enqueue(int batchSize,
++		const void* const* inputs,
++		void* const* outputs,
++		void* workspace,
++		cudaStream_t stream) noexcept
++	{
++		NV_CUDA_CHECK(cudaYoloLayerV3(inputs[0], outputs[0], batchSize, _n_grid_h, _n_grid_w, m_NumClasses,
++			m_NumBoxes, m_OutputSize, stream));
++		return 0;
++	}
++
++	size_t YoloLayer::getSerializationSize()const noexcept
++	{
++		return sizeof(m_NumBoxes) + sizeof(m_NumClasses) + sizeof(_n_grid_w) + sizeof(_n_grid_h) + sizeof(m_OutputSize);
++	}
++
++
++
++
++	PluginFieldCollection YoloLayerPluginCreator::mFC{};
++	std::vector<PluginField> YoloLayerPluginCreator::mPluginAttributes;
++
++	YoloLayerPluginCreator::YoloLayerPluginCreator()
++	{
++		mPluginAttributes.clear();
++
++		mFC.nbFields = mPluginAttributes.size();
++		mFC.fields = mPluginAttributes.data();
++	}
++
++	const char* YoloLayerPluginCreator::getPluginName() const noexcept
++	{
++		return "YOLO_TRT";
++	}
++
++	const char* YoloLayerPluginCreator::getPluginVersion() const noexcept
++	{
++		return "1.0";
++	}
++
++	const PluginFieldCollection* YoloLayerPluginCreator::getFieldNames()noexcept
++	{
++		return &mFC;
++	}
++
++	IPluginV2* YoloLayerPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc)noexcept
++	{
++		YoloLayer* obj = new YoloLayer();
++		obj->setPluginNamespace(mNamespace.c_str());
++		return obj;
++	}
++
++	IPluginV2* YoloLayerPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength)noexcept
++	{
++		// This object will be deleted when the network is destroyed, which will
++		// call MishPlugin::destroy()
++		YoloLayer* obj = new YoloLayer(serialData, serialLength);
++		obj->setPluginNamespace(mNamespace.c_str());
++		return obj;
++	}
++
++
++	void YoloLayerPluginCreator::setPluginNamespace(const char* libNamespace)noexcept
++	{
++		mNamespace = libNamespace;
++	}
++
++	const char* YoloLayerPluginCreator::getPluginNamespace() const noexcept
++	{
++		return mNamespace.c_str();
++	}
+ 
+-YoloLayerV3::YoloLayerV3(const uint32_t& numBoxes, const uint32_t& numClasses, const uint32_t& grid_h_,const uint32_t &grid_w_):
+-    m_NumBoxes(numBoxes),
+-    m_NumClasses(numClasses),
+-    _n_grid_h(grid_h_),
+-	_n_grid_w(grid_w_)
+-{
+-    assert(m_NumBoxes > 0);
+-    assert(m_NumClasses > 0);
+-	assert(_n_grid_h > 0);
+-	assert(_n_grid_w > 0);
+-    m_OutputSize = _n_grid_h * _n_grid_w * (m_NumBoxes * (4 + 1 + m_NumClasses));
+-}
+ 
+-int YoloLayerV3::getNbOutputs() const { return 1; }
+-
+-nvinfer1::Dims YoloLayerV3::getOutputDimensions(int index, const nvinfer1::Dims* inputs,
+-                                                int nbInputDims)
+-{
+-    assert(index == 0);
+-    assert(nbInputDims == 1);
+-    return inputs[0];
+-}
+-
+-void YoloLayerV3::configure(const nvinfer1::Dims* inputDims, int nbInputs,
+-                            const nvinfer1::Dims* outputDims, int nbOutputs, int maxBatchSize)
+-{
+-    assert(nbInputs == 1);
+-    assert(inputDims != nullptr);
+-}
+-
+-int YoloLayerV3::initialize() { return 0; }
+-
+-void YoloLayerV3::terminate() {}
+-
+-size_t YoloLayerV3::getWorkspaceSize(int maxBatchSize) const { return 0; }
+-
+-int YoloLayerV3::enqueue(int batchSize, const void* const* inputs, void** outputs, void* workspace,
+-                         cudaStream_t stream)
+-{
+-    NV_CUDA_CHECK(cudaYoloLayerV3(inputs[0], outputs[0], batchSize,_n_grid_h,_n_grid_w, m_NumClasses,
+-                                  m_NumBoxes, m_OutputSize, stream));
+-    return 0;
+-}
+-
+-size_t YoloLayerV3::getSerializationSize()
+-{
+-    return sizeof(m_NumBoxes) + sizeof(m_NumClasses) + sizeof(_n_grid_w)+sizeof(_n_grid_h) + sizeof(m_OutputSize);
+-}
+-
+-void YoloLayerV3::serialize(void* buffer)
+-{
+-    char *d = static_cast<char*>(buffer), *a = d;
+-    write(d, m_NumBoxes);
+-    write(d, m_NumClasses);
+-    write(d,_n_grid_h);
+-    write(d,_n_grid_w);
+-    write(d, m_OutputSize);
+-    assert(d == a + getSerializationSize());
+ }
+diff --git a/modules/plugin_factory.h b/modules/plugin_factory.h
+index fe76c39..6c3b266 100644
+--- a/modules/plugin_factory.h
++++ b/modules/plugin_factory.h
+@@ -31,8 +31,8 @@ SOFTWARE.
+ #include <cudnn.h>
+ #include <iostream>
+ #include <memory>
+-
+-#include "NvInferPlugin.h"
++#include <vector>
++#include "NvInfer.h"
+ 
+ #define NV_CUDA_CHECK(status)                                                                      \
+     {                                                                                              \
+@@ -50,96 +50,161 @@ cudaError_t cudaYoloLayerV3(const void* input, void* output, const uint32_t& bat
+ 	const uint32_t& numOutputClasses, const uint32_t& numBBoxes,
+ 	uint64_t outputSize, cudaStream_t stream);
+ 
+-class PluginFactory : public nvinfer1::IPluginFactory
+-{
+-
+-public:
+-    PluginFactory();
+-    nvinfer1::IPlugin* createPlugin(const char* layerName, const void* serialData,
+-                                    size_t serialLength) override;
+-    bool isPlugin(const char* name);
+-    void destroy();
+-
+-private:
+-    static const int m_MaxLeakyLayers = 72;
+-    static const int m_ReorgStride = 2;
+-    static constexpr float m_LeakyNegSlope = 0.1f;
+-    static const int m_NumBoxes = 5;
+-    static const int m_NumCoords = 4;
+-    static const int m_NumClasses = 80;
+-    static const int m_MaxYoloLayers = 3;
+-    int m_LeakyReLUCount = 0;
+-    int m_YoloLayerCount = 0;
+-    nvinfer1::plugin::RegionParameters m_RegionParameters{m_NumBoxes, m_NumCoords, m_NumClasses,
+-                                                          nullptr};
+-
+-    struct INvPluginDeleter
+-    {
+-        void operator()(nvinfer1::plugin::INvPlugin* ptr)
+-        {
+-            if (ptr)
+-            {
+-                ptr->destroy();
+-            }
+-        }
+-    };
+-    struct IPluginDeleter
+-    {
+-        void operator()(nvinfer1::IPlugin* ptr)
+-        {
+-            if (ptr)
+-            {
+-                ptr->terminate();
+-            }
+-        }
+-    };
+-    typedef std::unique_ptr<nvinfer1::plugin::INvPlugin, INvPluginDeleter> unique_ptr_INvPlugin;
+-    typedef std::unique_ptr<nvinfer1::IPlugin, IPluginDeleter> unique_ptr_IPlugin;
+-
+-    unique_ptr_INvPlugin m_ReorgLayer;
+-    unique_ptr_INvPlugin m_RegionLayer;
+-    unique_ptr_INvPlugin m_LeakyReLULayers[m_MaxLeakyLayers];
+-    unique_ptr_IPlugin m_YoloLayers[m_MaxYoloLayers];
+-};
+-
+-class YoloLayerV3 : public nvinfer1::IPlugin
++//class PluginFactory : public nvinfer1::IPluginFactory
++//{
++//
++//public:
++//    PluginFactory();
++//    nvinfer1::IPlugin* createPlugin(const char* layerName, const void* serialData,
++//                                    size_t serialLength);
++//    bool isPlugin(const char* name);
++//    void destroy();
++//
++//private:
++//    static const int m_MaxLeakyLayers = 72;
++//    static const int m_ReorgStride = 2;
++//    static constexpr float m_LeakyNegSlope = 0.1f;
++//    static const int m_NumBoxes = 5;
++//    static const int m_NumCoords = 4;
++//    static const int m_NumClasses = 80;
++//    static const int m_MaxYoloLayers = 3;
++//    int m_LeakyReLUCount = 0;
++//    int m_YoloLayerCount = 0;
++//    nvinfer1::plugin::RegionParameters m_RegionParameters{m_NumBoxes, m_NumCoords, m_NumClasses,
++//                                                          nullptr};
++//
++//    struct INvPluginDeleter
++//    {
++//        void operator()(nvinfer1::plugin::INvPlugin* ptr)
++//        {
++//            if (ptr)
++//            {
++//                ptr->destroy();
++//            }
++//        }
++//    };
++//    struct IPluginDeleter
++//    {
++//        void operator()(nvinfer1::IPlugin* ptr)
++//        {
++//            if (ptr)
++//            {
++//                ptr->terminate();
++//            }
++//        }
++//    };
++//    typedef std::unique_ptr<nvinfer1::plugin::INvPlugin, INvPluginDeleter> unique_ptr_INvPlugin;
++//    typedef std::unique_ptr<nvinfer1::IPlugin, IPluginDeleter> unique_ptr_IPlugin;
++//
++//    unique_ptr_INvPlugin m_ReorgLayer;
++//    unique_ptr_INvPlugin m_RegionLayer;
++//    unique_ptr_INvPlugin m_LeakyReLULayers[m_MaxLeakyLayers];
++//    unique_ptr_IPlugin m_YoloLayers[m_MaxYoloLayers];
++//};
++namespace nvinfer1
+ {
+-public:
+-    YoloLayerV3(const void* data, size_t length);
+-    YoloLayerV3(const uint32_t& numBoxes, const uint32_t& numClasses, const uint32_t& grid_h_,const uint32_t &grid_w_);
+-    int getNbOutputs() const override;
+-    nvinfer1::Dims getOutputDimensions(int index, const nvinfer1::Dims* inputs,
+-                                       int nbInputDims) override;
+-    void configure(const nvinfer1::Dims* inputDims, int nbInputs, const nvinfer1::Dims* outputDims,
+-                   int nbOutputs, int maxBatchSize) override;
+-    int initialize() override;
+-    void terminate() override;
+-    size_t getWorkspaceSize(int maxBatchSize) const override;
+-    int enqueue(int batchSize, const void* const* intputs, void** outputs, void* workspace,
+-                cudaStream_t stream) override;
+-    size_t getSerializationSize() override;
+-    void serialize(void* buffer) override;
+-
+-private:
+-    template <typename T>
+-    void write(char*& buffer, const T& val)
+-    {
+-        *reinterpret_cast<T*>(buffer) = val;
+-        buffer += sizeof(T);
+-    }
+-
+-    template <typename T>
+-    void read(const char*& buffer, T& val)
+-    {
+-        val = *reinterpret_cast<const T*>(buffer);
+-        buffer += sizeof(T);
+-    }
+-    uint32_t m_NumBoxes;
+-    uint32_t m_NumClasses;
+-    uint32_t m_GridSize;
+-    uint64_t m_OutputSize;
+-	uint32_t _n_grid_h;
+-	uint32_t _n_grid_w;
+-};
+-
++	template <typename T>
++	void wr(char*& buffer, const T& val)
++	{
++		*reinterpret_cast<T*>(buffer) = val;
++		buffer += sizeof(T);
++	}
++
++	template <typename T>
++	void re(const char*& buffer, T& val)
++	{
++		val = *reinterpret_cast<const T*>(buffer);
++		buffer += sizeof(T);
++	}
++
++	class YoloLayer : public IPluginV2
++	{
++	public:
++		explicit YoloLayer();
++		YoloLayer(const void* data, size_t length);
++		YoloLayer(const uint32_t& numBoxes, const uint32_t& numClasses, const uint32_t& grid_h_, const uint32_t &grid_w_);
++		int getNbOutputs() const noexcept override;
++		nvinfer1::Dims getOutputDimensions(int index, const nvinfer1::Dims* inputs,
++			int nbInputDims)noexcept override;
++		/*void configure(const nvinfer1::Dims* inputDims, int nbInputs, const nvinfer1::Dims* outputDims,
++					   int nbOutputs, int maxBatchSize)noexcept override;*/
++
++					   /*void configure(const nvinfer1::Dims* inputDims, int nbInputs,
++						   const nvinfer1::Dims* outputDims, int nbOutputs, int maxBatchSize)noexcept override;*/
++
++		int initialize()noexcept override;
++		void terminate()noexcept override;
++		size_t getWorkspaceSize(int maxBatchSize) const noexcept override;
++		
++		int enqueue(int batchSize, const void* const* inputs, void* const* outputs, void* workspace,
++			cudaStream_t stream) noexcept override;
++
++		size_t getSerializationSize() const noexcept  override;
++		void serialize(void* buffer) const noexcept  override;
++		
++		const char* getPluginType() const noexcept  override
++		{
++			return "YOLO_TRT";
++		}
++		bool supportsFormat(DataType type, PluginFormat format) const noexcept override;
++		void configureWithFormat(const Dims* inputDims, int nbInputs, const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept override;
++
++		const char* getPluginVersion() const noexcept  override
++		{
++			return "1.0";
++		}
++
++		void setPluginNamespace(const char* pluginNamespace) noexcept  override
++		{
++			_s_plugin_namespace = pluginNamespace;
++		}
++		const char* getPluginNamespace() const  noexcept override
++		{
++			return _s_plugin_namespace.c_str();
++		}
++		void destroy() noexcept  override
++		{
++			delete this;
++		}
++		IPluginV2* clone() const noexcept override;
++	private:
++	
++		std::string _s_plugin_namespace;
++		uint32_t m_NumBoxes;
++		uint32_t m_NumClasses;
++		uint32_t m_GridSize;
++		uint64_t m_OutputSize;
++		uint32_t _n_grid_h;
++		uint32_t _n_grid_w;
++	};
++
++
++
++	class YoloLayerPluginCreator : public IPluginCreator
++	{
++	public:
++		YoloLayerPluginCreator();
++
++		~YoloLayerPluginCreator() override = default;
++
++		const char* getPluginName() const noexcept  override;
++
++		const char* getPluginVersion() const  noexcept override;
++
++		const PluginFieldCollection* getFieldNames() noexcept  override;
++
++		IPluginV2* createPlugin(const char* name, const PluginFieldCollection* fc)  noexcept override;
++
++		IPluginV2* deserializePlugin(const char* name, const void* serialData, size_t serialLength) noexcept  override;
++
++		void setPluginNamespace(const char* libNamespace) noexcept  override;
++
++		const char* getPluginNamespace() const noexcept  override;
++
++	private:
++		std::string mNamespace;
++		static PluginFieldCollection mFC;
++		static std::vector<PluginField> mPluginAttributes;
++	};
++}
+ #endif // __PLUGIN_LAYER_H__
+diff --git a/modules/swish.cu b/modules/swish.cu
+new file mode 100755
+index 0000000..64826ac
+--- /dev/null
++++ b/modules/swish.cu
+@@ -0,0 +1,218 @@
++#include <cmath>
++#include <stdio.h>
++#include <cassert>
++#include <iostream>
++#include "swish.h"
++
++namespace nvinfer1
++{
++    SwishPlugin::SwishPlugin()
++    {
++    }
++
++    SwishPlugin::~SwishPlugin()
++    {
++    }
++
++    // create the plugin at runtime from a byte stream
++    SwishPlugin::SwishPlugin(const void* data, size_t length)
++    {
++        assert(length == sizeof(input_size_));
++        input_size_ = *reinterpret_cast<const int*>(data);
++    }
++
++    void SwishPlugin::serialize(void* buffer) const noexcept
++    {
++        *reinterpret_cast<int*>(buffer) = input_size_;
++    }
++
++    size_t SwishPlugin::getSerializationSize() const noexcept
++    {  
++        return sizeof(input_size_);
++    }
++
++    int SwishPlugin::initialize()noexcept
++    { 
++        return 0;
++    }
++
++	bool SwishPlugin::supportsFormat(DataType type, PluginFormat format) const noexcept
++	{
++		return (type == DataType::kFLOAT && format == PluginFormat::kLINEAR);
++	}
++
++	void SwishPlugin::configureWithFormat(const Dims* inputDims, int nbInputs,
++		const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept
++	{
++
++	}
++
++    Dims SwishPlugin::getOutputDimensions(int index, const Dims* inputs, int nbInputDims)noexcept
++    {
++        assert(nbInputDims == 1);
++        assert(index == 0);
++        input_size_ = inputs[0].d[0] * inputs[0].d[1] * inputs[0].d[2];
++        // Output dimensions
++        return Dims3(inputs[0].d[0], inputs[0].d[1], inputs[0].d[2]);
++    }
++
++    // Set plugin namespace
++    void SwishPlugin::setPluginNamespace(const char* pluginNamespace)noexcept
++    {
++        mPluginNamespace = pluginNamespace;
++    }
++
++    const char* SwishPlugin::getPluginNamespace() const noexcept
++    {
++        return mPluginNamespace;
++    }
++
++    // Return the DataType of the plugin output at the requested index
++    DataType SwishPlugin::getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
++    {
++        return DataType::kFLOAT;
++    }
++
++    // Return true if output tensor is broadcast across a batch.
++    bool SwishPlugin::isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const noexcept
++    {
++        return false;
++    }
++
++    // Return true if plugin can use input that is broadcast across batch without replication.
++    bool SwishPlugin::canBroadcastInputAcrossBatch(int inputIndex) const noexcept
++    {
++        return false;
++    }
++
++    void SwishPlugin::configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput)noexcept
++    {
++    }
++
++    // Attach the plugin object to an execution context and grant the plugin the access to some context resource.
++    void SwishPlugin::attachToContext(cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator)noexcept
++    {
++    }
++
++    // Detach the plugin object from its execution context.
++    void SwishPlugin::detachFromContext()noexcept {}
++
++    const char* SwishPlugin::getPluginType() const noexcept
++    {
++        return "Swish_TRT";
++    }
++
++    const char* SwishPlugin::getPluginVersion() const noexcept
++    {
++        return "1";
++    }
++
++    void SwishPlugin::destroy()noexcept
++    {
++        delete this;
++    }
++
++    // Clone the plugin
++    IPluginV2* SwishPlugin::clone() const noexcept
++    {
++        SwishPlugin *p = new SwishPlugin();
++        p->input_size_ = input_size_;
++        p->setPluginNamespace(mPluginNamespace);
++        return p;
++    }
++
++    __device__ float sigmoid_activate_kernel(const float& x) { return 1.0f / (1.0f + __expf(-x)); }
++    __global__ void swish_kernel(const float *input, float *output, int num_elem) 
++	{
++
++        int idx = threadIdx.x + blockDim.x * blockIdx.x;
++        if (idx >= num_elem) return;
++
++        //float t = exp(input[idx]);
++        //if (input[idx] > 20.0) {
++        //    t *= t;
++        //    output[idx] = (t - 1.0) / (t + 1.0);
++        //} else {
++        //    float tt = t * t;
++        //    output[idx] = (tt + 2.0 * t) / (tt + 2.0 * t + 2.0);
++        //}
++        //output[idx] *= input[idx];
++        output[idx] = input[idx] * sigmoid_activate_kernel(input[idx]);
++    }
++
++    void SwishPlugin::forwardGpu(const float *const * inputs, float* output, cudaStream_t stream, int batchSize)
++	{
++        int block_size = thread_count_;
++        int grid_size = (input_size_ * batchSize + block_size - 1) / block_size;
++        swish_kernel<<<grid_size, block_size, 0, stream>>>(inputs[0], output, input_size_ * batchSize);
++    }
++
++	int SwishPlugin::enqueue(int batchSize,
++		const void* const* inputs,
++		void* const* outputs,
++		void* workspace,
++		cudaStream_t stream) noexcept 
++	{
++        //assert(batchSize == 1);
++        //GPU
++        //CUDA_CHECK(cudaStreamSynchronize(stream));
++        forwardGpu((const float *const *)inputs, (float*)outputs[0], stream, batchSize);
++        return 0;
++    }
++
++    PluginFieldCollection SwishPluginCreator::mFC{};
++    std::vector<PluginField> SwishPluginCreator::mPluginAttributes;
++
++    SwishPluginCreator::SwishPluginCreator()
++    {
++        mPluginAttributes.clear();
++
++        mFC.nbFields = mPluginAttributes.size();
++        mFC.fields = mPluginAttributes.data();
++    }
++
++    const char* SwishPluginCreator::getPluginName() const noexcept
++    {
++            return "Swish_TRT";
++    }
++
++    const char* SwishPluginCreator::getPluginVersion() const noexcept
++    {
++            return "1";
++    }
++
++    const PluginFieldCollection* SwishPluginCreator::getFieldNames()noexcept
++    {
++            return &mFC;
++    }
++
++    IPluginV2* SwishPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc)noexcept
++    {
++        SwishPlugin* obj = new SwishPlugin();
++        obj->setPluginNamespace(mNamespace.c_str());
++        return obj;
++    }
++
++    IPluginV2* SwishPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength)noexcept
++    {
++        // This object will be deleted when the network is destroyed, which will
++        // call SwishPlugin::destroy()
++        SwishPlugin* obj = new SwishPlugin(serialData, serialLength);
++        obj->setPluginNamespace(mNamespace.c_str());
++        return obj;
++    }
++
++
++	void SwishPluginCreator::setPluginNamespace(const char* libNamespace)noexcept
++	{
++		mNamespace = libNamespace;
++	}
++
++	const char* SwishPluginCreator::getPluginNamespace() const noexcept
++	{
++		return mNamespace.c_str();
++	}
++
++
++}
++
+diff --git a/modules/swish.h b/modules/swish.h
+new file mode 100755
+index 0000000..c6edf5d
+--- /dev/null
++++ b/modules/swish.h
+@@ -0,0 +1,106 @@
++#ifndef _SWISH_PLUGIN_H
++#define _SWISH_PLUGIN_H
++
++#include <string>
++#include <vector>
++#include "NvInfer.h"
++
++
++//https://github.com/wang-xinyu/tensorrtx
++namespace nvinfer1
++{
++    class SwishPlugin: public IPluginV2
++    {
++        public:
++            explicit SwishPlugin();
++            SwishPlugin(const void* data, size_t length);
++
++            ~SwishPlugin();
++
++            int getNbOutputs() const  noexcept override
++            {
++                return 1;
++            }
++
++            Dims getOutputDimensions(int index, const Dims* inputs, int nbInputDims) noexcept  override;
++
++            int initialize() noexcept  override;
++
++            virtual void terminate() noexcept  override {}
++
++            virtual size_t getWorkspaceSize(int maxBatchSize) const noexcept  override { return 0;}
++
++         //   virtual int enqueue(int batchSize, const void*const * inputs, void** outputs, void* workspace, cudaStream_t stream);
++			int enqueue(int batchSize, const void* const* inputs, void* const* outputs, void* workspace,
++				cudaStream_t stream) noexcept override;
++			bool supportsFormat(DataType type, PluginFormat format) const noexcept override;
++			void configureWithFormat(const Dims* inputDims, int nbInputs, const Dims* outputDims, int nbOutputs, DataType type, PluginFormat format, int maxBatchSize) noexcept override;
++
++            virtual size_t getSerializationSize() const noexcept  override;
++
++            virtual void serialize(void* buffer) const noexcept  override;
++
++            bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) const noexcept {
++                return inOut[pos].format == TensorFormat::kLINEAR && inOut[pos].type == DataType::kFLOAT;
++            }
++
++            const char* getPluginType() const noexcept  override;
++
++            const char* getPluginVersion() const noexcept  override;
++
++            void destroy()  noexcept override;
++
++            IPluginV2* clone() const noexcept  override;
++
++            void setPluginNamespace(const char* pluginNamespace) noexcept  override;
++
++            const char* getPluginNamespace() const  noexcept override;
++
++            DataType getOutputDataType(int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept;
++
++            bool isOutputBroadcastAcrossBatch(int outputIndex, const bool* inputIsBroadcasted, int nbInputs) const noexcept;
++
++            bool canBroadcastInputAcrossBatch(int inputIndex) const noexcept;
++
++            void attachToContext(
++                    cudnnContext* cudnnContext, cublasContext* cublasContext, IGpuAllocator* gpuAllocator)noexcept;
++
++            void configurePlugin(const PluginTensorDesc* in, int nbInput, const PluginTensorDesc* out, int nbOutput)noexcept;
++
++            void detachFromContext()noexcept;
++
++            int input_size_;
++        private:
++            void forwardGpu(const float *const * inputs, float* output, cudaStream_t stream, int batchSize = 1);
++            int thread_count_ = 256;
++            const char* mPluginNamespace;
++    };
++
++    class SwishPluginCreator : public IPluginCreator
++    {
++        public:
++            SwishPluginCreator();
++
++            ~SwishPluginCreator() override = default;
++
++            const char* getPluginName() const noexcept  override;
++
++            const char* getPluginVersion() const  noexcept override;
++
++            const PluginFieldCollection* getFieldNames() noexcept  override;
++
++            IPluginV2* createPlugin(const char* name, const PluginFieldCollection* fc)  noexcept override;
++
++            IPluginV2* deserializePlugin(const char* name, const void* serialData, size_t serialLength) noexcept  override;
++
++			void setPluginNamespace(const char* libNamespace) noexcept  override;
++
++			const char* getPluginNamespace() const noexcept  override;
++
++        private:
++            std::string mNamespace;
++            static PluginFieldCollection mFC;
++            static std::vector<PluginField> mPluginAttributes;
++    };
++}
++#endif 
+diff --git a/modules/trt_utils.cpp b/modules/trt_utils.cpp
+index 5c2dcc1..fb2a04b 100644
+--- a/modules/trt_utils.cpp
++++ b/modules/trt_utils.cpp
+@@ -29,9 +29,11 @@ SOFTWARE.
+ #include <fstream>
+ #include <iomanip>
+ using namespace nvinfer1;
++REGISTER_TENSORRT_PLUGIN(SwishPluginCreator);
+ REGISTER_TENSORRT_PLUGIN(MishPluginCreator);
+ REGISTER_TENSORRT_PLUGIN(ChunkPluginCreator);
+ REGISTER_TENSORRT_PLUGIN(HardswishPluginCreator);
++REGISTER_TENSORRT_PLUGIN(YoloLayerPluginCreator);
+ 
+ cv::Mat blobFromDsImages(const std::vector<DsImage>& inputImages,
+ 						const int& inputH,
+@@ -323,11 +325,11 @@ std::vector<BBoxInfo> nonMaximumSuppression(const float nmsThresh, std::vector<B
+     return out;
+ }
+ 
+-nvinfer1::ICudaEngine* loadTRTEngine(const std::string planFilePath, PluginFactory* pluginFactory,
++nvinfer1::ICudaEngine* loadTRTEngine(const std::string planFilePath, /*PluginFactory* pluginFactory,*/
+                                      Logger& logger)
+ {
+     // reading the model in memory
+-    std::cout << "Loading TRT Engine..." << std::endl;
++    std::cout << "Loading TRT Engine..." << planFilePath << std::endl;
+     assert(fileExists(planFilePath));
+     std::stringstream trtModelStream;
+     trtModelStream.seekg(0, trtModelStream.beg);
+@@ -345,7 +347,7 @@ nvinfer1::ICudaEngine* loadTRTEngine(const std::string planFilePath, PluginFacto
+ 
+     nvinfer1::IRuntime* runtime = nvinfer1::createInferRuntime(logger);
+     nvinfer1::ICudaEngine* engine
+-        = runtime->deserializeCudaEngine(modelMem, modelSize, pluginFactory);
++        = runtime->deserializeCudaEngine(modelMem, modelSize/*, pluginFactory*/);
+     free(modelMem);
+     runtime->destroy();
+     std::cout << "Loading Complete!" << std::endl;
+@@ -427,13 +429,15 @@ void displayDimType(const nvinfer1::Dims d)
+     std::cout << "(" << d.nbDims << ") ";
+     for (int i = 0; i < d.nbDims; ++i)
+     {
+-        switch (d.type[i])
+-        {
+-        case nvinfer1::DimensionType::kSPATIAL: std::cout << "kSPATIAL "; break;
+-        case nvinfer1::DimensionType::kCHANNEL: std::cout << "kCHANNEL "; break;
+-        case nvinfer1::DimensionType::kINDEX: std::cout << "kINDEX "; break;
+-        case nvinfer1::DimensionType::kSEQUENCE: std::cout << "kSEQUENCE "; break;
+-        }
++		
++   //     switch (d.type[i])
++   //     {
++			////nvinfer1::DimensionOperation::
++   //     case nvinfer1::DimensionOperation::kSPATIAL: std::cout << "kSPATIAL "; break;
++   //     case nvinfer1::DimensionOperation::kCHANNEL: std::cout << "kCHANNEL "; break;
++   //     case nvinfer1::DimensionOperation::kINDEX: std::cout << "kINDEX "; break;
++   //     case nvinfer1::DimensionOperation::kSEQUENCE: std::cout << "kSEQUENCE "; break;
++   //     }
+     }
+     std::cout << std::endl;
+ }
+@@ -482,7 +486,7 @@ nvinfer1::ILayer* netAddConvLinear(int layerIdx, std::map<std::string, std::stri
+ {
+     assert(block.at("type") == "convolutional");
+     assert(block.find("batch_normalize") == block.end());
+-    assert(block.at("activation") == "linear");
++    assert(block.at("activation") == "linear" || block.at("activation") == "logistic" );
+     assert(block.find("filters") != block.end());
+     assert(block.find("pad") != block.end());
+     assert(block.find("size") != block.end());
+@@ -669,6 +673,146 @@ nvinfer1::ILayer* net_conv_bn_mish(int layerIdx,
+ 	return mish;
+ }
+ 
++nvinfer1::ILayer* net_conv_bn_swish(int layerIdx, 
++	std::map<std::string, std::string>& block,
++	std::vector<float>& weights,
++	std::vector<nvinfer1::Weights>& trtWeights,
++	int& weightPtr,
++	int& inputChannels,
++	nvinfer1::ITensor* input,
++	nvinfer1::INetworkDefinition* network)
++{
++	assert(block.at("type") == "convolutional");
++	assert(block.find("batch_normalize") != block.end());
++	assert(block.at("batch_normalize") == "1");
++	assert(block.at("activation") == "swish" || block.at("activation") == "silu");
++	assert(block.find("filters") != block.end());
++	assert(block.find("pad") != block.end());
++	assert(block.find("size") != block.end());
++	assert(block.find("stride") != block.end());
++
++	bool batchNormalize, bias;
++	if (block.find("batch_normalize") != block.end())
++	{
++		batchNormalize = (block.at("batch_normalize") == "1");
++		bias = false;
++	}
++	else
++	{
++		batchNormalize = false;
++		bias = true;
++	}
++	// all conv_bn_leaky layers assume bias is false
++	assert(batchNormalize == true && bias == false);
++
++	int filters = std::stoi(block.at("filters"));
++	int padding = std::stoi(block.at("pad"));
++	int kernelSize = std::stoi(block.at("size"));
++	int stride = std::stoi(block.at("stride"));
++	int pad;
++	if (padding)
++		pad = (kernelSize - 1) / 2;
++	else
++		pad = 0;
++
++	/***** CONVOLUTION LAYER *****/
++	/*****************************/
++	// batch norm weights are before the conv layer
++	// load BN biases (bn_biases)
++	std::vector<float> bnBiases;
++	for (int i = 0; i < filters; ++i)
++	{
++		bnBiases.push_back(weights[weightPtr]);
++		weightPtr++;
++	}
++	// load BN weights
++	std::vector<float> bnWeights;
++	for (int i = 0; i < filters; ++i)
++	{
++		bnWeights.push_back(weights[weightPtr]);
++		weightPtr++;
++	}
++	// load BN running_mean
++	std::vector<float> bnRunningMean;
++	for (int i = 0; i < filters; ++i)
++	{
++		bnRunningMean.push_back(weights[weightPtr]);
++		weightPtr++;
++	}
++	// load BN running_var
++	std::vector<float> bnRunningVar;
++	for (int i = 0; i < filters; ++i)
++	{
++		// 1e-05 for numerical stability
++		bnRunningVar.push_back(sqrt(weights[weightPtr] + 1.0e-5f));
++		weightPtr++;
++	}
++	// load Conv layer weights (GKCRS)
++	int size = filters * inputChannels * kernelSize * kernelSize;
++	nvinfer1::Weights convWt{ nvinfer1::DataType::kFLOAT, nullptr, size };
++	float* val = new float[size];
++	for (int i = 0; i < size; ++i)
++	{
++		val[i] = weights[weightPtr];
++		weightPtr++;
++	}
++	convWt.values = val;
++	trtWeights.push_back(convWt);
++	nvinfer1::Weights convBias{ nvinfer1::DataType::kFLOAT, nullptr, 0 };
++	trtWeights.push_back(convBias);
++	nvinfer1::IConvolutionLayer* conv = network->addConvolution(
++		*input, filters, nvinfer1::DimsHW{ kernelSize, kernelSize }, convWt, convBias);
++	assert(conv != nullptr);
++	std::string convLayerName = "conv_" + std::to_string(layerIdx);
++	conv->setName(convLayerName.c_str());
++	conv->setStride(nvinfer1::DimsHW{ stride, stride });
++	conv->setPadding(nvinfer1::DimsHW{ pad, pad });
++
++	/***** BATCHNORM LAYER *****/
++	/***************************/
++	size = filters;
++	// create the weights
++	nvinfer1::Weights shift{ nvinfer1::DataType::kFLOAT, nullptr, size };
++	nvinfer1::Weights scale{ nvinfer1::DataType::kFLOAT, nullptr, size };
++	nvinfer1::Weights power{ nvinfer1::DataType::kFLOAT, nullptr, size };
++	float* shiftWt = new float[size];
++	for (int i = 0; i < size; ++i)
++	{
++		shiftWt[i]
++			= bnBiases.at(i) - ((bnRunningMean.at(i) * bnWeights.at(i)) / bnRunningVar.at(i));
++	}
++	shift.values = shiftWt;
++	float* scaleWt = new float[size];
++	for (int i = 0; i < size; ++i)
++	{
++		scaleWt[i] = bnWeights.at(i) / bnRunningVar[i];
++	}
++	scale.values = scaleWt;
++	float* powerWt = new float[size];
++	for (int i = 0; i < size; ++i)
++	{
++		powerWt[i] = 1.0;
++	}
++	power.values = powerWt;
++	trtWeights.push_back(shift);
++	trtWeights.push_back(scale);
++	trtWeights.push_back(power);
++	// Add the batch norm layers
++	nvinfer1::IScaleLayer* bn = network->addScale(
++		*conv->getOutput(0), nvinfer1::ScaleMode::kCHANNEL, shift, scale, power);
++	assert(bn != nullptr);
++	std::string bnLayerName = "batch_norm_" + std::to_string(layerIdx);
++	bn->setName(bnLayerName.c_str());
++	/***** ACTIVATION LAYER *****/
++	/****************************/
++	auto creator = getPluginRegistry()->getPluginCreator("Swish_TRT", "1");
++	const nvinfer1::PluginFieldCollection* pluginData = creator->getFieldNames();
++	nvinfer1::IPluginV2 *pluginObj = creator->createPlugin(("swish" + std::to_string(layerIdx)).c_str(), pluginData);
++	nvinfer1::ITensor* inputTensors[] = { bn->getOutput(0) };
++	auto swish = network->addPluginV2(&inputTensors[0], 1, *pluginObj);
++	return swish;
++}
++
+ nvinfer1::ILayer * layer_split(const int n_layer_index_,
+ 	nvinfer1::ITensor *input_,
+ 	nvinfer1::INetworkDefinition* network)
+@@ -824,6 +968,14 @@ nvinfer1::ILayer * layer_act(nvinfer1::ITensor* input_,
+ 		assert(act != nullptr);
+ 		return act;
+ 	}
++	else if (s_act_ == "silu")
++	{
++		auto sig = network_->addActivation(*input_, nvinfer1::ActivationType::kSIGMOID);
++		assert(sig != nullptr);
++		auto act = network_->addElementWise(*input_, *sig->getOutput(0), ElementWiseOperation::kPROD);
++		assert(act != nullptr);
++		return act;
++	}
+ 	return nullptr;
+ }
+ 
+@@ -885,6 +1037,34 @@ nvinfer1::ILayer * layer_conv(std::vector<nvinfer1::Weights> &trtWeights_,
+ 	return conv;
+ }
+ 
++nvinfer1::ILayer * C3(std::vector<nvinfer1::Weights> &trtWeights_,
++    std::string s_model_name_,
++    std::map<std::string, std::vector<float>> &map_wts_,
++    nvinfer1::INetworkDefinition* network_,
++    nvinfer1::ITensor* input_,
++    const int c2_,
++    const int n_depth_,
++    const bool b_short_cut_,
++    const int group_,
++    const float e_ )
++{
++    int c_ = (int)((float)c2_ * e_);
++    auto cv1 = layer_conv_bn_act(trtWeights_, s_model_name_ +".cv1", map_wts_, input_, network_, c_, 1, 1, 1, true, true, "silu");
++    auto cv2 = layer_conv_bn_act(trtWeights_, s_model_name_ +".cv2", map_wts_, input_, network_, c_, 1, 1, 1, true, true, "silu");
++    auto out = cv1;
++    for (int d = 0; d < n_depth_; ++d) {
++        std::string m_name = s_model_name_ + ".m." + std::to_string(d);
++	out = layer_bottleneck(trtWeights_, m_name, map_wts_, network_, out->getOutput(0), c_, b_short_cut_, group_, 1.f);
++    }
++    nvinfer1::ITensor** concatInputs = reinterpret_cast<nvinfer1::ITensor**>(malloc(sizeof(nvinfer1::ITensor*) *2));
++    concatInputs[0] = out->getOutput(0);
++    concatInputs[1] = cv2->getOutput(0);
++    auto cat = layer_concate(concatInputs, 2, 0, network_);
++
++    auto cv3 = layer_conv_bn_act(trtWeights_, s_model_name_ +".cv3", map_wts_, cat->getOutput(0), network_, c2_, 1, 1, 1, true, true, "silu");
++    return cv3;
++}
++
+ nvinfer1::ILayer * layer_bottleneck_csp(std::vector<nvinfer1::Weights> &trtWeights_,
+ 	std::string s_model_name_,
+ 	std::map<std::string, std::vector<float>> &map_wts_,
+@@ -961,6 +1141,61 @@ nvinfer1::ILayer * layer_spp(std::vector<nvinfer1::Weights> &trtWeights_,
+ 	return cv2;
+ }
+ 
++nvinfer1::ILayer * layer_sppf(std::vector<nvinfer1::Weights> &trtWeights_,
++	std::string s_model_name_,
++	std::map<std::string, std::vector<float>> &map_wts_,
++	nvinfer1::INetworkDefinition* network_,
++	nvinfer1::ITensor* input_,
++	const int c2_,
++	int k_)
++{
++	std::vector<int> chw = dims2chw(input_->getDimensions());
++	int c1 = chw[0];//dims2chw(input_->getDimensions())[0];
++	int c_ = c1 / 2;
++	nvinfer1::ILayer * x = layer_conv_bn_act(trtWeights_, s_model_name_ + ".cv1", map_wts_, input_, network_, c_, 1);
++	nvinfer1::ITensor** concatInputs
++		= reinterpret_cast<nvinfer1::ITensor**>(malloc(sizeof(nvinfer1::ITensor*) * 4));
++	concatInputs[0] = x->getOutput(0);
++
++	//y1
++	nvinfer1::IPoolingLayer* y1
++		= network_->addPoolingNd(*x->getOutput(0),
++			nvinfer1::PoolingType::kMAX,
++			nvinfer1::DimsHW{ k_,k_ });
++	assert(y1);
++	int pad = k_ / 2;
++	y1->setPaddingNd(nvinfer1::DimsHW{ pad,pad });
++	y1->setStrideNd(nvinfer1::DimsHW{ 1, 1 });
++	concatInputs[1] = y1->getOutput(0);
++
++	//y2
++	nvinfer1::IPoolingLayer* y2
++		= network_->addPoolingNd(*y1->getOutput(0),
++			nvinfer1::PoolingType::kMAX,
++			nvinfer1::DimsHW{ k_,k_ });
++	assert(y2);
++	y2->setPaddingNd(nvinfer1::DimsHW{ pad,pad });
++	y2->setStrideNd(nvinfer1::DimsHW{ 1, 1 });
++	concatInputs[2] = y2->getOutput(0);
++
++	//y3
++	nvinfer1::IPoolingLayer* y3
++		= network_->addPoolingNd(*y2->getOutput(0),
++			nvinfer1::PoolingType::kMAX,
++			nvinfer1::DimsHW{ k_,k_ });
++	assert(y3);
++	y3->setPaddingNd(nvinfer1::DimsHW{ pad,pad });
++	y3->setStrideNd(nvinfer1::DimsHW{ 1, 1 });
++	concatInputs[3] = y3->getOutput(0);
++
++	nvinfer1::IConcatenationLayer* concat
++		= network_->addConcatenation(concatInputs, 4);
++	//concat->setAxis(0);
++	assert(concat != nullptr);
++	nvinfer1::ILayer *cv2 = layer_conv_bn_act(trtWeights_, s_model_name_ + ".cv2", map_wts_, concat->getOutput(0), network_, c2_, 1);
++	assert(cv2 != nullptr);
++	return cv2;
++}
+ 
+ nvinfer1::ILayer *layer_upsample(std::string s_model_name_,
+ 	std::map<std::string, std::vector<float>> &map_wts_,
+@@ -1386,8 +1621,8 @@ nvinfer1::ILayer* netAddUpsample(int layerIdx, std::map<std::string, std::string
+ void printLayerInfo(std::string layerIndex, std::string layerName, std::string layerInput,
+                     std::string layerOutput, std::string weightPtr)
+ {
+-    std::cout << std::setw(6) << std::left << layerIndex << std::setw(15) << std::left << layerName;
++    /*std::cout << std::setw(6) << std::left << layerIndex << std::setw(15) << std::left << layerName;
+     std::cout << std::setw(20) << std::left << layerInput << std::setw(20) << std::left
+               << layerOutput;
+-    std::cout << std::setw(6) << std::left << weightPtr << std::endl;
++    std::cout << std::setw(6) << std::left << weightPtr << std::endl;*/
+ }
+diff --git a/modules/trt_utils.h b/modules/trt_utils.h
+index 37fc35d..4371e80 100644
+--- a/modules/trt_utils.h
++++ b/modules/trt_utils.h
+@@ -36,6 +36,7 @@ SOFTWARE.
+ #include <opencv2/imgproc/imgproc.hpp>
+ 
+ #include "mish.h"
++#include "swish.h"
+ #include "chunk.h"
+ #include "hardswish.h"
+ #include <set>
+@@ -46,6 +47,9 @@ SOFTWARE.
+ #include "ds_image.h"
+ #include "plugin_factory.h"
+ //#include "logging.h"
++
++
++
+ class DsImage;
+ struct BBox
+ {
+@@ -77,7 +81,7 @@ public:
+ 		return *this;
+ 	}
+ 
+-    void log(nvinfer1::ILogger::Severity severity, const char* msg) override
++    void log(nvinfer1::ILogger::Severity severity, const char* msg)  noexcept override
+     {
+         // suppress info-level messages
+         if (severity == Severity::kINFO) return;
+@@ -94,40 +98,40 @@ public:
+     }
+ };
+ 
+-class YoloTinyMaxpoolPaddingFormula : public nvinfer1::IOutputDimensionsFormula
+-{
+-
+-private:
+-    std::set<std::string> m_SamePaddingLayers;
+-
+-    nvinfer1::DimsHW compute(nvinfer1::DimsHW inputDims, nvinfer1::DimsHW kernelSize,
+-                             nvinfer1::DimsHW stride, nvinfer1::DimsHW padding,
+-                             nvinfer1::DimsHW dilation, const char* layerName) const override
+-    {
+-     //   assert(inputDims.d[0] == inputDims.d[1]);
+-        assert(kernelSize.d[0] == kernelSize.d[1]);
+-        assert(stride.d[0] == stride.d[1]);
+-        assert(padding.d[0] == padding.d[1]);
+-
+-		int output_h, output_w;
+-        // Only layer maxpool_12 makes use of same padding
+-        if (m_SamePaddingLayers.find(layerName) != m_SamePaddingLayers.end())
+-        {
+-            output_h = (inputDims.d[0] + 2 * padding.d[0]) / stride.d[0];
+-            output_w = (inputDims.d[1] + 2 * padding.d[1]) / stride.d[1];
+-        }
+-        // Valid Padding
+-        else
+-        {
+-            output_h = (inputDims.d[0] - kernelSize.d[0]) / stride.d[0] + 1;
+-            output_w = (inputDims.d[1] - kernelSize.d[1]) / stride.d[1] + 1;
+-        }
+-        return nvinfer1::DimsHW{output_h, output_w};
+-    }
+-
+-public:
+-    void addSamePaddingLayer(std::string input) { m_SamePaddingLayers.insert(input); }
+-};
++//class YoloTinyMaxpoolPaddingFormula : public nvinfer1::IOutputDimensionsFormula
++//{
++//
++//private:
++//    std::set<std::string> m_SamePaddingLayers;
++//
++//    nvinfer1::DimsHW compute(nvinfer1::DimsHW inputDims, nvinfer1::DimsHW kernelSize,
++//                             nvinfer1::DimsHW stride, nvinfer1::DimsHW padding,
++//                             nvinfer1::DimsHW dilation, const char* layerName) const override
++//    {
++//     //   assert(inputDims.d[0] == inputDims.d[1]);
++//        assert(kernelSize.d[0] == kernelSize.d[1]);
++//        assert(stride.d[0] == stride.d[1]);
++//        assert(padding.d[0] == padding.d[1]);
++//
++//		int output_h, output_w;
++//        // Only layer maxpool_12 makes use of same padding
++//        if (m_SamePaddingLayers.find(layerName) != m_SamePaddingLayers.end())
++//        {
++//            output_h = (inputDims.d[0] + 2 * padding.d[0]) / stride.d[0];
++//            output_w = (inputDims.d[1] + 2 * padding.d[1]) / stride.d[1];
++//        }
++//        // Valid Padding
++//        else
++//        {
++//            output_h = (inputDims.d[0] - kernelSize.d[0]) / stride.d[0] + 1;
++//            output_w = (inputDims.d[1] - kernelSize.d[1]) / stride.d[1] + 1;
++//        }
++//        return nvinfer1::DimsHW{output_h, output_w};
++//    }
++//
++//public:
++//    void addSamePaddingLayer(std::string input) { m_SamePaddingLayers.insert(input); }
++//};
+ 
+ // Common helper functions
+ cv::Mat blobFromDsImages(const std::vector<DsImage>& inputImages, const int& inputH,
+@@ -150,7 +154,7 @@ std::vector<BBoxInfo> diou_nms(const float numThresh, std::vector<BBoxInfo> binf
+ std::vector<BBoxInfo> nmsAllClasses(const float nmsThresh, std::vector<BBoxInfo>& binfo,
+                                     const uint32_t numClasses, const std::string &model_type);
+ std::vector<BBoxInfo> nonMaximumSuppression(const float nmsThresh, std::vector<BBoxInfo> binfo);
+-nvinfer1::ICudaEngine* loadTRTEngine(const std::string planFilePath, PluginFactory* pluginFactory,
++nvinfer1::ICudaEngine* loadTRTEngine(const std::string planFilePath,/* PluginFactory* pluginFactory,*/
+                                      Logger& logger);
+ std::vector<float> loadWeights(const std::string weightsFilePath, const std::string& networkType);
+ std::string dimsToString(const nvinfer1::Dims d);
+@@ -176,6 +180,24 @@ nvinfer1::ILayer* net_conv_bn_mish(int layerIdx,
+ 	nvinfer1::ITensor* input,
+ 	nvinfer1::INetworkDefinition* network);
+ 
++nvinfer1::ILayer* net_conv_bn_swish(int layerIdx,
++	std::map<std::string, std::string>& block,
++	std::vector<float>& weights,
++	std::vector<nvinfer1::Weights>& trtWeights,
++	int& weightPtr,
++	int& inputChannels,
++	nvinfer1::ITensor* input,
++	nvinfer1::INetworkDefinition* network);
++
++nvinfer1::ILayer* net_conv_bn_swish(int layerIdx,
++	std::map<std::string, std::string>& block,
++	std::vector<float>& weights,
++	std::vector<nvinfer1::Weights>& trtWeights,
++	int& weightPtr,
++	int& inputChannels,
++	nvinfer1::ITensor* input,
++	nvinfer1::INetworkDefinition* network);
++
+ nvinfer1::ILayer* netAddConvBNLeaky(int layerIdx, std::map<std::string, std::string>& block,
+                                     std::vector<float>& weights,
+                                     std::vector<nvinfer1::Weights>& trtWeights, int& weightPtr,
+@@ -214,11 +236,22 @@ nvinfer1::ILayer * layer_conv_bn_act(std::vector<nvinfer1::Weights> &trtWeights_
+ 	const int group_ =1,
+ 	const bool b_padding_ = true,
+ 	const bool b_bn_ = true,
+-	const std::string s_act_ = "hardswish");
++	const std::string s_act_ = "silu");
+ 
+ nvinfer1::ILayer * layer_act(nvinfer1::ITensor* input_,
+ 	nvinfer1::INetworkDefinition* network_,
+-	const std::string s_act_ = "hardswish");
++	const std::string s_act_ = "silu");
++
++nvinfer1::ILayer * C3(std::vector<nvinfer1::Weights> &trtWeights_,
++    std::string s_model_name_,
++    std::map<std::string, std::vector<float>> &map_wts_,
++    nvinfer1::INetworkDefinition* network_,
++    nvinfer1::ITensor* input_,
++    const int c2_,
++    const int n_depth_ = 1,
++    const bool b_short_cut_ = true,
++    const int group_ = 1,
++    const float e_ = 0.5);
+ 
+ nvinfer1::ILayer * layer_bottleneck_csp(std::vector<nvinfer1::Weights> &trtWeights_,
+ 	std::string s_model_name_,
+@@ -239,6 +272,14 @@ nvinfer1::ILayer * layer_spp(std::vector<nvinfer1::Weights> &trtWeights_,
+ 	const int c2_,
+ 	const std::vector<int> &vec_args_);
+ 
++nvinfer1::ILayer * layer_sppf(std::vector<nvinfer1::Weights> &trtWeights_,
++	std::string s_model_name_,
++	std::map<std::string, std::vector<float>> &map_wts_,
++	nvinfer1::INetworkDefinition* network_,
++	nvinfer1::ITensor* input_,
++	const int c2_,
++	int k_);
++
+ nvinfer1::ILayer *layer_upsample(std::string s_model_name_,
+ 	std::map<std::string, std::vector<float>> &map_wts_,
+ 	nvinfer1::INetworkDefinition* network_,
+diff --git a/modules/yolo.cpp b/modules/yolo.cpp
+index 8118d93..6ecfecf 100644
+--- a/modules/yolo.cpp
++++ b/modules/yolo.cpp
+@@ -9,6 +9,7 @@
+ using namespace nvinfer1;
+ REGISTER_TENSORRT_PLUGIN(DetectPluginCreator);
+ 
++
+ Yolo::Yolo( const NetworkInfo& networkInfo, const InferParams& inferParams) :
+ 	m_NetworkType(networkInfo.networkType),
+ 	m_ConfigFilePath(networkInfo.configFilePath),
+@@ -36,9 +37,9 @@ Yolo::Yolo( const NetworkInfo& networkInfo, const InferParams& inferParams) :
+ 	m_Context(nullptr),
+ 	m_InputBindingIndex(-1),
+ 	m_CudaStream(nullptr),
+-	m_PluginFactory(new PluginFactory),
+-	m_TinyMaxpoolPaddingFormula(new YoloTinyMaxpoolPaddingFormula),
+ 	_n_yolo_ind(0)
++//	m_PluginFactory(new PluginFactory),
++//	m_TinyMaxpoolPaddingFormula(new YoloTinyMaxpoolPaddingFormula),
+ {
+ 	// m_ClassNames = loadListFromTextFile(m_LabelsFilePath);
+ 
+@@ -51,7 +52,7 @@ Yolo::Yolo( const NetworkInfo& networkInfo, const InferParams& inferParams) :
+ 	{
+ 		parseConfigBlocks();
+ 	}
+-	m_EnginePath = networkInfo.data_path + "-" + m_Precision + "-batch" + std::to_string(m_BatchSize) + ".engine";
++	m_EnginePath = networkInfo.enginePath;
+ 	if (m_Precision == "kFLOAT")
+ 	{
+ 		if ("yolov5" == m_NetworkType)
+@@ -95,8 +96,8 @@ Yolo::Yolo( const NetworkInfo& networkInfo, const InferParams& inferParams) :
+ 		assert(0);
+ 	}
+ 
+-	assert(m_PluginFactory != nullptr);
+-	m_Engine = loadTRTEngine(m_EnginePath, m_PluginFactory, m_Logger);
++	//assert(m_PluginFactory != nullptr);
++	m_Engine = loadTRTEngine(m_EnginePath,/* m_PluginFactory,*/ m_Logger);
+ 	assert(m_Engine != nullptr);
+ 	m_Context = m_Engine->createExecutionContext();
+ 	assert(m_Context != nullptr);
+@@ -125,13 +126,13 @@ Yolo::~Yolo()
+         m_Engine = nullptr;
+     }
+ 
+-    if (m_PluginFactory)
++   /* if (m_PluginFactory)
+     {
+         m_PluginFactory->destroy();
+         m_PluginFactory = nullptr;
+-    }
++    }*/
+ 
+-    m_TinyMaxpoolPaddingFormula.reset();
++//    m_TinyMaxpoolPaddingFormula.reset();
+ }
+ 
+ std::vector<int> split_layer_index(const std::string &s_,const std::string &delimiter_)
+@@ -169,15 +170,15 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType, Int8EntropyCalibr
+ 
+     nvinfer1::ITensor* data = m_Network->addInput(
+         m_InputBlobName.c_str(), nvinfer1::DataType::kFLOAT,
+-        nvinfer1::DimsCHW{static_cast<int>(m_InputC), static_cast<int>(m_InputH),
+-                          static_cast<int>(m_InputW)});
++		nvinfer1::Dims{ 3,static_cast<int>(m_InputC), static_cast<int>(m_InputH),
++						  static_cast<int>(m_InputW) });
+     assert(data != nullptr);
+     // Add elementwise layer to normalize pixel values 0-1
+     nvinfer1::Dims divDims{
+         3,
+-        {static_cast<int>(m_InputC), static_cast<int>(m_InputH), static_cast<int>(m_InputW)},
+-        {nvinfer1::DimensionType::kCHANNEL, nvinfer1::DimensionType::kSPATIAL,
+-         nvinfer1::DimensionType::kSPATIAL}};
++        {static_cast<int>(m_InputC), static_cast<int>(m_InputH), static_cast<int>(m_InputW)}
++        /*{nvinfer1::DimensionType::kCHANNEL, nvinfer1::DimensionType::kSPATIAL,
++         nvinfer1::DimensionType::kSPATIAL}*/};
+     nvinfer1::Weights divWeights{nvinfer1::DataType::kFLOAT, nullptr,
+                                  static_cast<int64_t>(m_InputSize)};
+     float* divWt = new float[m_InputSize];
+@@ -197,8 +198,8 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType, Int8EntropyCalibr
+ 	if (/*"yolov3" == m_NetworkType || */"yolov3-tiny" == m_NetworkType)
+ 	{
+ 		// Set the output dimensions formula for pooling layers
+-		assert(m_TinyMaxpoolPaddingFormula && "Tiny maxpool padding formula not created");
+-		m_Network->setPoolingOutputDimensionsFormula(m_TinyMaxpoolPaddingFormula.get());
++	//	assert(m_TinyMaxpoolPaddingFormula && "Tiny maxpool padding formula not created");
++	//	m_Network->setPoolingOutputDimensionsFormula(m_TinyMaxpoolPaddingFormula.get());
+ 	}
+ 
+     // build the network using the network API
+@@ -238,6 +239,13 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType, Int8EntropyCalibr
+ 										channels, previous, m_Network);
+ 				layerType = "conv-bn-mish";
+ 			}
++			else if ((m_configBlocks.at(i).find("batch_normalize") != m_configBlocks.at(i).end()) &&
++				("swish" == activation || "silu" == activation))
++			{
++				out = net_conv_bn_swish(i, m_configBlocks.at(i), weights, trtWeights, weightPtr,
++										channels, previous, m_Network);
++				layerType = "conv-bn-swish";
++			}
+             else// if("linear" == activation)
+             {
+                 out = netAddConvLinear(i, m_configBlocks.at(i), weights, trtWeights, weightPtr,
+@@ -290,13 +298,14 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType, Int8EntropyCalibr
+                 * (curYoloTensor.numBBoxes * (5 + curYoloTensor.numClasses));
+             std::string layerName = "yolo_" + std::to_string(outputTensorCount);
+             curYoloTensor.blobName = layerName;
+-            nvinfer1::IPlugin* yoloPlugin
+-                = new YoloLayerV3(m_OutputTensors.at(outputTensorCount).numBBoxes,
++            nvinfer1::IPluginV2* yoloPlugin
++                = new nvinfer1::YoloLayer(m_OutputTensors.at(outputTensorCount).numBBoxes,
+                                   m_OutputTensors.at(outputTensorCount).numClasses,
+                                   m_OutputTensors.at(outputTensorCount).grid_h,
+                                   m_OutputTensors.at(outputTensorCount).grid_w);
+             assert(yoloPlugin != nullptr);
+-            nvinfer1::IPluginLayer* yolo = m_Network->addPlugin(&previous, 1, *yoloPlugin);
++            nvinfer1::IPluginV2Layer* yolo = m_Network->addPluginV2(&previous, 1, *yoloPlugin);
++			
+             assert(yolo != nullptr);
+             yolo->setName(layerName.c_str());
+             std::string inputVol = dimsToString(previous->getDimensions());
+@@ -405,7 +414,7 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType, Int8EntropyCalibr
+             // Add same padding layers
+             if (m_configBlocks.at(i).at("size") == "2" && m_configBlocks.at(i).at("stride") == "1")
+             {
+-                m_TinyMaxpoolPaddingFormula->addSamePaddingLayer("maxpool_" + std::to_string(i));
++              //  m_TinyMaxpoolPaddingFormula->addSamePaddingLayer("maxpool_" + std::to_string(i));
+             }
+             std::string inputVol = dimsToString(previous->getDimensions());
+             nvinfer1::ILayer* out = netAddMaxpool(i, m_configBlocks.at(i), previous, m_Network);
+@@ -433,13 +442,13 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType, Int8EntropyCalibr
+  //   for (auto& tensor : m_OutputTensors) std::cout << tensor.blobName << std::endl;
+ 
+     // Create and cache the engine if not already present
+-    if (fileExists(m_EnginePath))
+-    {
+-        std::cout << "Using previously generated plan file located at " << m_EnginePath
+-                  << std::endl;
+-        destroyNetworkUtils(trtWeights);
+-        return;
+-    }
++    // if (fileExists(m_EnginePath))
++    // {
++    //     std::cout << "Using previously generated plan file located at " << m_EnginePath
++    //               << std::endl;
++    //     destroyNetworkUtils(trtWeights);
++    //     return;
++    // }
+ 
+ 	/*std::cout << "Unable to find cached TensorRT engine for network : " << m_NetworkType
+ 			  << " precision : " << m_Precision << " and batch size :" << m_BatchSize << std::endl;*/
+@@ -463,20 +472,21 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType, Int8EntropyCalibr
+      //   m_Builder->setHalf2Mode(true);
+     }
+ 
+-    m_Builder->allowGPUFallback(true);
++  //  m_Builder->allowGPUFallback(true);
+     int nbLayers = m_Network->getNbLayers();
+     int layersOnDLA = 0;
+  //   std::cout << "Total number of layers: " << nbLayers << std::endl;
+-    for (int i = 0; i < nbLayers; i++)
++   /* for (int i = 0; i < nbLayers; i++)
+     {
+         nvinfer1::ILayer* curLayer = m_Network->getLayer(i);
++		m_Builder->
+         if (m_DeviceType == "kDLA" && m_Builder->canRunOnDLA(curLayer))
+         {
+             m_Builder->setDeviceType(curLayer, nvinfer1::DeviceType::kDLA);
+             layersOnDLA++;
+             std::cout << "Set layer " << curLayer->getName() << " to run on DLA" << std::endl;
+         }
+-    }
++    }*/
+  //   std::cout << "Total number of layers on DLA: " << layersOnDLA << std::endl;
+ 
+     // Build the engine
+@@ -497,6 +507,40 @@ int make_division(const float f_in_, const int n_divisor_)
+ 	return ceil(f_in_ / n_divisor_)*n_divisor_;
+ }
+ 
++void parse_c3_args(const std::string s_args_, int &n_out_ch_, bool &b_shourt_cut_)
++{
++	std::string s_args = s_args_;
++	while (!s_args.empty())
++	{
++		auto npos = s_args.find_first_of(',');
++		if (npos != std::string::npos)
++		{
++			n_out_ch_ = std::stoi(trim(s_args.substr(0, npos)));
++			s_args.erase(0, npos + 1);
++		}
++		else
++		{
++			try
++			{
++				n_out_ch_ = std::stoi(trim(s_args.substr(0, npos)));
++			}
++			catch (const std::exception&)
++			{
++
++			}
++			if ("False" == trim(s_args))
++			{
++				b_shourt_cut_ = false;
++			}
++			else if ("True" == trim(s_args))
++			{
++				b_shourt_cut_ = true;
++			}
++			break;
++		}
++	}
++}
++
+ void parse_bottleneck_args(const std::string s_args_, int &n_out_ch_, bool &b_shourt_cut_)
+ {
+ 	std::string s_args = s_args_;
+@@ -618,8 +662,8 @@ void Yolo::create_engine_yolov5(const nvinfer1::DataType dataType,
+ 	std::vector<nvinfer1::Weights> trtWeights;
+ 	int channels = m_InputC;
+ 	m_Builder = nvinfer1::createInferBuilder(m_Logger);
+-	nvinfer1::IBuilderConfig* config = m_Builder->createBuilderConfig();
+-	m_Network = m_Builder->createNetworkV2(0U);
++
++	m_Network = m_Builder->createNetworkV2(0);
+ 	if ((dataType == nvinfer1::DataType::kINT8 && !m_Builder->platformHasFastInt8())
+ 		|| (dataType == nvinfer1::DataType::kHALF && !m_Builder->platformHasFastFp16()))
+ 	{
+@@ -629,15 +673,15 @@ void Yolo::create_engine_yolov5(const nvinfer1::DataType dataType,
+ 	nvinfer1::ITensor* data = m_Network->addInput(
+ 		m_InputBlobName.c_str(),
+ 		nvinfer1::DataType::kFLOAT,
+-		nvinfer1::DimsCHW{ static_cast<int>(m_InputC), static_cast<int>(m_InputH),
++		nvinfer1::Dims{3, static_cast<int>(m_InputC), static_cast<int>(m_InputH),
+ 		static_cast<int>(m_InputW) });
+ 	assert(data != nullptr);
+ 	// Add elementwise layer to normalize pixel values 0-1
+ 	nvinfer1::Dims divDims{
+ 		3,
+-		{ static_cast<int>(m_InputC), static_cast<int>(m_InputH), static_cast<int>(m_InputW) },
++		{ static_cast<int>(m_InputC), static_cast<int>(m_InputH), static_cast<int>(m_InputW) }/*,
+ 		{ nvinfer1::DimensionType::kCHANNEL, nvinfer1::DimensionType::kSPATIAL,
+-		nvinfer1::DimensionType::kSPATIAL } };
++		nvinfer1::DimensionType::kSPATIAL }*/ };
+ 
+ 	nvinfer1::Weights divWeights{ nvinfer1::DataType::kFLOAT,
+ 		nullptr,
+@@ -704,6 +748,24 @@ void Yolo::create_engine_yolov5(const nvinfer1::DataType dataType,
+ 			tensorOutputs.push_back(out->getOutput(0));
+ 			printLayerInfo(layerIndex, "Conv", inputVol, outputVol, "");
+ 		}//end Conv
++		else if ("C3" == m_configBlocks.at(i).at("type"))
++		{
++			std::string inputVol = dimsToString(previous->getDimensions());
++			int filters = 0;
++			bool short_cut =true;
++			int number = std::stoi(m_configBlocks[i]["number"]);
++			parse_bottleneck_args(m_configBlocks[i]["args"], filters, short_cut);
++			int n_out_channel = (n_output != filters) ? make_division(filters*_f_width_multiple, 8) : filters;
++			int n_depth = (number > 1) ? (std::max(int(round(_f_depth_multiple *number)), 1)) : number;
++			std::string s_model_name = "model." + std::to_string(i- 1);
++			auto out = C3(trtWeights,s_model_name, model_wts, m_Network, previous, n_out_channel, n_depth, short_cut);
++			previous = out->getOutput(0);
++			assert(previous != nullptr);
++			channels = getNumChannels(previous);
++			std::string outputVol = dimsToString(previous->getDimensions());
++			tensorOutputs.push_back(out->getOutput(0));
++			printLayerInfo(layerIndex, "C3", inputVol, outputVol, "");
++		}// end C3
+ 		else if ("BottleneckCSP" == m_configBlocks.at(i).at("type"))
+ 		{
+ 			std::string inputVol = dimsToString(previous->getDimensions());
+@@ -738,6 +800,24 @@ void Yolo::create_engine_yolov5(const nvinfer1::DataType dataType,
+ 			tensorOutputs.push_back(out->getOutput(0));
+ 			printLayerInfo(layerIndex, "SPP", inputVol, outputVol, "");
+ 		}//end SPP
++		else if ("SPPF" == m_configBlocks.at(i).at("type"))
++		{
++			std::string inputVol = dimsToString(previous->getDimensions());
++			int filters = 0;
++			std::vector<int> vec_k;
++			//parse_spp_args(m_configBlocks[i]["args"], filters, vec_k);
++			std::vector<int> args = parse_int_list(m_configBlocks[i]["args"]);
++			filters = args[0];
++			int n_out_channel = (n_output != filters) ? make_division(filters*_f_width_multiple, 8) : filters;
++			std::string s_model_name = "model." + std::to_string(i - 1);
++			auto out = layer_sppf(trtWeights, s_model_name, model_wts, m_Network, previous, n_out_channel, args[1]);
++			previous = out->getOutput(0);
++			assert(previous != nullptr);
++			channels = getNumChannels(previous);
++			std::string outputVol = dimsToString(previous->getDimensions());
++			tensorOutputs.push_back(out->getOutput(0));
++			printLayerInfo(layerIndex, "SPP", inputVol, outputVol, "");
++		}//end SPPF
+ 		else if ("nn.Upsample" == m_configBlocks.at(i).at("type"))
+ 		{
+ 			std::string inputVol = dimsToString(previous->getDimensions());
+@@ -849,6 +929,7 @@ void Yolo::create_engine_yolov5(const nvinfer1::DataType dataType,
+ 	<< " precision : " << m_Precision << " and batch size :" << m_BatchSize << std::endl;*/
+ 
+ 	m_Builder->setMaxBatchSize(m_BatchSize);
++	nvinfer1::IBuilderConfig* config = m_Builder->createBuilderConfig();
+ 	config->setMaxWorkspaceSize(1<<20);
+ 	if (dataType == nvinfer1::DataType::kINT8)
+ 	{
+@@ -865,20 +946,20 @@ void Yolo::create_engine_yolov5(const nvinfer1::DataType dataType,
+ 		//   m_Builder->setHalf2Mode(true);
+ 	}
+ 
+-	m_Builder->allowGPUFallback(true);
+-	int nbLayers = m_Network->getNbLayers();
+-	int layersOnDLA = 0;
+-	//   std::cout << "Total number of layers: " << nbLayers << std::endl;
+-	for (int i = 0; i < nbLayers; i++)
+-	{
+-		nvinfer1::ILayer* curLayer = m_Network->getLayer(i);
+-		if (m_DeviceType == "kDLA" && m_Builder->canRunOnDLA(curLayer))
+-		{
+-			m_Builder->setDeviceType(curLayer, nvinfer1::DeviceType::kDLA);
+-			layersOnDLA++;
+-			std::cout << "Set layer " << curLayer->getName() << " to run on DLA" << std::endl;
+-		}
+-	}
++//	m_Builder->allowGPUFallback(true);
++	//int nbLayers = m_Network->getNbLayers();
++	//int layersOnDLA = 0;
++	////   std::cout << "Total number of layers: " << nbLayers << std::endl;
++	//for (int i = 0; i < nbLayers; i++)
++	//{
++	//	nvinfer1::ILayer* curLayer = m_Network->getLayer(i);
++	//	if (m_DeviceType == "kDLA" && m_Builder->canRunOnDLA(curLayer))
++	//	{
++	//		m_Builder->setDeviceType(curLayer, nvinfer1::DeviceType::kDLA);
++	//		layersOnDLA++;
++	//		std::cout << "Set layer " << curLayer->getName() << " to run on DLA" << std::endl;
++	//	}
++	//}
+ 	//   std::cout << "Total number of layers on DLA: " << layersOnDLA << std::endl;
+ 
+ 	// Build the engine
+@@ -921,7 +1002,7 @@ void Yolo::load_weights_v5(const std::string s_weights_path_,
+ }
+ void Yolo::doInference(const unsigned char* input, const uint32_t batchSize)
+ {
+-	Timer timer;
++	// Timer timer;
+     assert(batchSize <= m_BatchSize && "Image batch size exceeds TRT engines batch size");
+     NV_CUDA_CHECK(cudaMemcpyAsync(m_DeviceBuffers.at(m_InputBindingIndex), input,
+                                   batchSize * m_InputSize * sizeof(float), cudaMemcpyHostToDevice,
+@@ -935,7 +1016,7 @@ void Yolo::doInference(const unsigned char* input, const uint32_t batchSize)
+                                       cudaMemcpyDeviceToHost, m_CudaStream));
+     }
+     cudaStreamSynchronize(m_CudaStream);
+-	timer.out("inference");
++	// timer.out("inference");
+ }
+ 
+ std::vector<BBoxInfo> Yolo::decodeDetections(const int& imageIdx,
+@@ -964,9 +1045,9 @@ std::vector<std::map<std::string, std::string>> Yolo::parseConfigFile(const std:
+ 
+     while (getline(file, line))
+     {
++        line = trim(line);
+         if (line.empty()) continue;
+         if (line.front() == '#') continue;
+-        line = trim(line);
+         if (line.front() == '[')
+         {
+             if (!block.empty())
+@@ -1001,10 +1082,12 @@ void Yolo::parseConfigBlocks()
+             assert((block.find("width") != block.end()) && "Missing 'width' param in network cfg");
+             assert((block.find("channels") != block.end())
+                    && "Missing 'channels' param in network cfg");
++            assert((block.find("batch") != block.end())
++                   && "Missing 'batch' param in network cfg");
+ 
+-            m_InputH = std::stoul(block.at("height"));
+-            m_InputW = std::stoul(block.at("width"));
+-            m_InputC = std::stoul(block.at("channels"));
++            m_InputH = std::stoul(trim(block.at("height")));
++            m_InputW = std::stoul(trim(block.at("width")));
++            m_InputC = std::stoul(trim(block.at("channels")));
+ 			m_BatchSize = std::stoi(trim(block.at("batch")));
+          //   assert(m_InputW == m_InputH);
+             m_InputSize = m_InputC * m_InputH * m_InputW;
+@@ -1042,7 +1125,9 @@ void Yolo::parseConfigBlocks()
+             if ((m_NetworkType == "yolov3") ||
+ 				(m_NetworkType == "yolov3-tiny") ||
+ 				(m_NetworkType == "yolov4") ||
+-				(m_NetworkType == "yolov4-tiny"))
++				(m_NetworkType == "yolov4-tiny") ||
++				(m_NetworkType == "yolov7") ||
++				(m_NetworkType == "yolov7-tiny"))				
+             {
+                 assert((block.find("mask") != block.end())
+                        && std::string("Missing 'mask' param in " + block.at("type") + " layer")
+@@ -1082,7 +1167,7 @@ void Yolo::parseConfigBlocks()
+ 			outputTensor.gridSize = (m_InputH / 32) * pow(2, _n_yolo_ind);
+ 			outputTensor.grid_h = (m_InputH / 32) * pow(2, _n_yolo_ind);
+ 			outputTensor.grid_w = (m_InputW / 32) * pow(2, _n_yolo_ind);
+-			if (m_NetworkType == "yolov4")//pan
++			if (m_NetworkType == "yolov4" || m_NetworkType == "yolov7" || m_NetworkType == "yolov7-tiny")//pan
+ 			{
+ 				outputTensor.gridSize = (m_InputH / 32) * pow(2, 2-_n_yolo_ind);
+ 				outputTensor.grid_h = (m_InputH / 32) * pow(2, 2-_n_yolo_ind);
+@@ -1175,13 +1260,20 @@ void Yolo::parse_cfg_blocks_v5(const  std::vector<std::map<std::string, std::str
+ 				outputTensor.numBBoxes = static_cast<uint32_t>(outputTensor.masks.size());
+ 				outputTensor.numClasses = _n_classes;
+ 				outputTensor.blobName = "yolo_" + std::to_string(i);
+-				outputTensor.grid_h = (m_InputH / 32) * pow(2 ,2-i);
+-				outputTensor.grid_w = (m_InputW / 32) * pow(2 ,2-i);
++				if (i < 3)
++				{
++					outputTensor.grid_h = (m_InputH / 32) * pow(2 ,2-i);
++					outputTensor.grid_w = (m_InputW / 32) * pow(2 ,2-i);
++				}
++				else
++				{
++					outputTensor.grid_h = (m_InputH / 32) /2;
++					outputTensor.grid_w = (m_InputW / 32) /2;
++				}
+ 				outputTensor.stride_h = m_InputH / outputTensor.grid_h;
+ 				outputTensor.stride_w = m_InputW / outputTensor.grid_w;
+ 				outputTensor.volume = outputTensor.grid_h * outputTensor.grid_w
+ 					*(outputTensor.numBBoxes*(5 + outputTensor.numClasses));
+-
+ 				m_OutputTensors.push_back(outputTensor);
+ 
+ 				if (m_ClassNames.empty())
+@@ -1195,6 +1287,7 @@ void Yolo::parse_cfg_blocks_v5(const  std::vector<std::map<std::string, std::str
+ 			
+ 		}
+ 	}
++	std::cout << "Config Done!" << std::endl;
+ }
+ void Yolo::allocateBuffers()
+ {
+diff --git a/modules/yolo.h b/modules/yolo.h
+index 057b111..33b35dd 100644
+--- a/modules/yolo.h
++++ b/modules/yolo.h
+@@ -27,13 +27,15 @@ SOFTWARE.
+ #define _YOLO_H_
+ 
+ #include "calibrator.h"
+-#include "plugin_factory.h"
++//#include "plugin_factory.h"
+ #include "trt_utils.h"
+ 
+ #include "NvInfer.h"
+ #include "NvInferPlugin.h"
+ #include "NvInferRuntimeCommon.h"
+ #include "cuda_runtime_api.h"
++#include <algorithm>
++#include <cmath>
+ #include <stdint.h>
+ #include <string>
+ #include <vector>
+@@ -110,7 +112,8 @@ public:
+     std::vector<BBoxInfo> decodeDetections(const int& imageIdx,
+ 											const int& imageH,
+                                            const int& imageW);
+-
++    
++    void setProbThresh(const float prob) { m_ProbThresh = prob; }
+     virtual ~Yolo();
+ 
+ protected:
+@@ -135,7 +138,7 @@ protected:
+ 	uint32_t _n_classes = 0;
+ 	float _f_depth_multiple = 0;
+ 	float _f_width_multiple = 0;
+-    const float m_ProbThresh;
++    float m_ProbThresh;
+     const float m_NMSThresh;
+     std::vector<std::string> m_ClassNames;
+     // Class ids for coco benchmarking
+@@ -157,8 +160,8 @@ protected:
+     std::vector<void*> m_DeviceBuffers;
+     int m_InputBindingIndex;
+     cudaStream_t m_CudaStream;
+-    PluginFactory* m_PluginFactory;
+-    std::unique_ptr<YoloTinyMaxpoolPaddingFormula> m_TinyMaxpoolPaddingFormula;
++    //PluginFactory* m_PluginFactory;
++   // std::unique_ptr<YoloTinyMaxpoolPaddingFormula> m_TinyMaxpoolPaddingFormula;
+ 
+     virtual std::vector<BBoxInfo> decodeTensor(const int imageIdx, const int imageH,
+                                                const int imageW, const TensorInfo& tensor)
+@@ -188,11 +191,12 @@ protected:
+ 		float &sh,float &sw,
+ 		int &xOffset,int &yOffset)
+ 	{
+-		float dim = std::max(imageW, imageH);
+-		int resizeH = ((imageH / dim) * m_InputH);
+-		int resizeW = ((imageW / dim) * m_InputW);
+-		sh = static_cast<float>(resizeH) / static_cast<float>(imageH);
+-		sw = static_cast<float>(resizeW) / static_cast<float>(imageW);
++        float r = std::min(static_cast<float>(m_InputH) / static_cast<float>(imageH), static_cast<float>(m_InputW) / static_cast<float>(imageW));
++        int resizeH = (std::round(imageH*r));
++        int resizeW = (std::round(imageW*r));
++
++		sh = r;
++		sw = r;
+ 		if ((m_InputW - resizeW) % 2) resizeW--;
+ 		if ((m_InputH - resizeH) % 2) resizeH--;
+ 		assert((m_InputW - resizeW) % 2 == 0);
+diff --git a/modules/yolov5.cpp b/modules/yolov5.cpp
+index 497ba6d..0658cf5 100644
+--- a/modules/yolov5.cpp
++++ b/modules/yolov5.cpp
+@@ -1,12 +1,11 @@
+ 
+ #include "yolov5.h"
+-
++#include "decodeTensorCUDA.h"
+ 
+ YoloV5::YoloV5(
+ 	const NetworkInfo &network_info_,
+ 	const InferParams &infer_params_) :
+ 	Yolo( network_info_, infer_params_) {}
+-
+ std::vector<BBoxInfo> YoloV5::decodeTensor(const int imageIdx, const int imageH, const int imageW, const TensorInfo& tensor)
+ {
+ 	float	scale_h = 1.f;
+@@ -14,54 +13,42 @@ std::vector<BBoxInfo> YoloV5::decodeTensor(const int imageIdx, const int imageH,
+ 	int	xOffset = 0;
+ 	int yOffset = 0;
+ 	calcuate_letterbox_message(m_InputH, m_InputW, imageH, imageW, scale_h, scale_w, xOffset, yOffset);
+-	const float* detections = &tensor.hostBuffer[imageIdx * tensor.volume];
+-
+ 	std::vector<BBoxInfo> binfo;
++	
++	// decode output (x,y,w,h,maxProb,maxIndex)
++	float* boxes = decodeTensorCUDA(imageIdx, tensor);
++	
++	// Ergodic result
+ 	for (uint32_t y = 0; y < tensor.grid_h; ++y)
+ 	{
+ 		for (uint32_t x = 0; x < tensor.grid_w; ++x)
+ 		{
+ 			for (uint32_t b = 0; b < tensor.numBBoxes; ++b)
+-			{
+-				const float pw = tensor.anchors[tensor.masks[b] * 2];
+-				const float ph = tensor.anchors[tensor.masks[b] * 2 + 1];
+-
+-				const int numGridCells = tensor.grid_h * tensor.grid_w;
++			{	
+ 				const int bbindex = y * tensor.grid_w+ x;
+ 				const float bx
+-					= x + detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 0)];
++					= boxes[18 * bbindex + 6*b + 0];
+ 
+ 				const float by
+-					= y + detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 1)];
+-				const float bw
+-					= pw * detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 2)];
+-				const float bh
+-					= ph * detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 3)];
++					= boxes[18 * bbindex + 6*b + 1];
+ 
+-				const float objectness
+-					= detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 4)];
++				const float bw
++					= boxes[18 * bbindex + 6*b + 2];
+ 
+-				float maxProb = 0.0f;
+-				int maxIndex = -1;
++				const float bh
++					= boxes[18 * bbindex + 6*b + 3];
+ 
+-				for (uint32_t i = 0; i < tensor.numClasses; ++i)
+-				{
+-					float prob
+-						= (detections[bbindex
+-							+ numGridCells * (b * (5 + tensor.numClasses) + (5 + i))]);
++				const float maxProb
++					= boxes[18 * bbindex + 6*b + 4];
+ 
+-					if (prob > maxProb)
+-					{
+-						maxProb = prob;
+-						maxIndex = i;
+-					}
+-				}
+-				maxProb = objectness * maxProb;
++				const int maxIndex 
++					= (int) boxes[18 * bbindex + 6*b + 5];
+ 
+ 				if (maxProb > m_ProbThresh)
+ 				{
+-					add_bbox_proposal(bx, by, bw, bh, tensor.stride_h, tensor.stride_w, scale_h, scale_w,xOffset, yOffset, maxIndex, maxProb, imageW, imageH, binfo);
++					add_bbox_proposal(bx, by, bw, bh, tensor.stride_h, tensor.stride_w, scale_h, scale_w, xOffset, yOffset, maxIndex, maxProb, imageW, imageH, binfo);
+ 				}
++				
+ 			}
+ 		}
+ 	}
+diff --git a/modules/yolov7.cpp b/modules/yolov7.cpp
+new file mode 100755
+index 0000000..68e7fee
+--- /dev/null
++++ b/modules/yolov7.cpp
+@@ -0,0 +1,75 @@
++
++#include "yolov7.h"
++#include <cmath>
++
++float sigmoid(float x) {
++  return 1 / (1 + exp(-x));
++}
++
++
++
++YoloV7::YoloV7(	const NetworkInfo &network_info_,
++	const InferParams &infer_params_) :
++	Yolo(network_info_, infer_params_) {}
++
++std::vector<BBoxInfo> YoloV7::decodeTensor(const int imageIdx, const int imageH, const int imageW, const TensorInfo& tensor)
++{
++	float	scale_h = 1.f;
++	float	scale_w = 1.f;
++	int	xOffset = 0;
++	int yOffset = 0;
++
++	const float* detections = &tensor.hostBuffer[imageIdx * tensor.volume];
++
++	std::vector<BBoxInfo> binfo;
++	for (uint32_t y = 0; y < tensor.grid_h; ++y)
++	{
++		for (uint32_t x = 0; x < tensor.grid_w; ++x)
++		{
++			for (uint32_t b = 0; b < tensor.numBBoxes; ++b)
++			{
++				const float pw = tensor.anchors[tensor.masks[b] * 2];
++				const float ph = tensor.anchors[tensor.masks[b] * 2 + 1];
++
++				const int numGridCells = tensor.grid_h * tensor.grid_w;
++				const int bbindex = y * tensor.grid_w + x;
++				const float bx
++					= detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 0)] * 2. + (x - 0.5);
++				const float by
++					= detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 1)] * 2. + (y - 0.5);
++				const float w = sigmoid(log(detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 2)]));
++                const float bw
++					=  w * w * 4 * pw;
++                const float h = sigmoid(log(detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 3)]));
++				const float bh
++					=  h * h * 4 * ph;
++
++				const float objectness
++					= detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 4)];
++
++				float maxProb = 0.0f;
++				int maxIndex = -1;
++
++				for (uint32_t i = 0; i < tensor.numClasses; ++i)
++				{
++					float prob
++						= (detections[bbindex
++							+ numGridCells * (b * (5 + tensor.numClasses) + (5 + i))]);
++
++					if (prob > maxProb)
++					{
++						maxProb = prob;
++						maxIndex = i;
++					}
++				}
++				maxProb = objectness * maxProb;
++
++				if (maxProb > m_ProbThresh)
++				{
++					add_bbox_proposal(bx, by, bw, bh, tensor.stride_h, tensor.stride_w, scale_h, scale_w, xOffset, yOffset, maxIndex, maxProb, imageW, imageH, binfo);
++				}
++			}
++		}
++	}
++	return binfo;
++}
+diff --git a/modules/yolov7.h b/modules/yolov7.h
+new file mode 100755
+index 0000000..90ca05f
+--- /dev/null
++++ b/modules/yolov7.h
+@@ -0,0 +1,17 @@
++#ifndef CLASS_YOLOV7_H_
++#define CLASS_YOLOV7_H_
++#include "yolo.h"
++class YoloV7 :public Yolo
++{
++public:
++	YoloV7(
++		const NetworkInfo &network_info_,
++		const InferParams &infer_params_);
++private:
++	std::vector<BBoxInfo> decodeTensor(const int imageIdx,
++		const int imageH,
++		const int imageW,
++		const TensorInfo& tensor) override;
++};
++
++#endif
+diff --git a/samples/ModelWrapper.cpp b/samples/ModelWrapper.cpp
+new file mode 100755
+index 0000000..c4c6a00
+--- /dev/null
++++ b/samples/ModelWrapper.cpp
+@@ -0,0 +1,124 @@
++#include "ModelWrapper.h"
++#include "class_timer.hpp"
++#include "class_detector.h"
++
++#include <iostream>
++#include <fstream>
++#include <experimental/filesystem>
++
++namespace fs = std::experimental::filesystem;
++
++class EngineModel {
++	private:
++		std::unique_ptr<Detector> detector;
++	
++	public:
++		EngineModel(std::string modelCfgPath, std::string enginePath, std::string netType, float confidence, float threshold){
++			
++
++			Config config;
++			config.file_model_cfg           = modelCfgPath;
++			config.engine_path              = enginePath;
++			config.detect_thresh            = confidence;
++			config.nms_thresh               = threshold;
++			
++			if (netType == "yolov4") {
++            config.net_type = YOLOV4;
++            } else if (netType == "yolov4-tiny") {
++                config.net_type = YOLOV4_TINY;
++            } else if (netType == "yolov7") {
++                config.net_type = YOLOV7;
++            } else if (netType == "yolov7-tiny") {
++                config.net_type = YOLOV7_TINY;
++            }
++
++			// Initiate tensorRT model
++			detector = std::make_unique<Detector>();
++			detector->init(config);
++			std::cout << "Initiate  " << enginePath << std::endl;
++		} 
++
++		std::vector<BatchResult> detect(const std::vector<cv::Mat> batchImages) {
++			std::vector<BatchResult> batchResults;
++			detector->detect(batchImages, batchResults);
++			return batchResults;
++		}
++
++};
++
++JNIEXPORT jlong JNICALL Java_ai_brain_model_modelWrapper_loadEngineModel(JNIEnv* env, jobject obj, jstring modelCfgPath, jstring enginePath, jstring netType, jfloat confidence, jfloat threshold) {
++
++	const char* cfgpth  = env->GetStringUTFChars(modelCfgPath, 0);
++	const char* enginepth  = env->GetStringUTFChars(enginePath, 0);
++	const char* type  = env->GetStringUTFChars(netType, 0);
++
++
++	EngineModel* engineModel = new EngineModel(cfgpth, enginepth, type, confidence, threshold);
++	jlong engineModelPointer = reinterpret_cast<jlong>(engineModel);
++
++	env->ReleaseStringUTFChars(modelCfgPath, cfgpth);
++	env->ReleaseStringUTFChars(enginePath, enginepth);
++	env->ReleaseStringUTFChars(netType, type);
++
++	return engineModelPointer;
++}
++
++
++// JNIEXPORT jlong JNICALL Java_ai_brain_model_modelWrapper_createEngineModel(JNIEnv* env, jobject obj, jstring modelPath, jstring inferencePrecision, jfloat confidence, jfloat threshold) {
++
++//     const char* modelpth  = env->GetStringUTFChars(modelPath, 0);
++//     const char* precision = env->GetStringUTFChars(inferencePrecision, 0);
++
++//     EngineModel* engineModel = new EngineModel(modelpth, precision, confidence, threshold);
++//     jlong engineModelPointer = reinterpret_cast<jlong>(engineModel);
++
++//     env->ReleaseStringUTFChars(modelPath, modelpth);
++//     env->ReleaseStringUTFChars(inferencePrecision, precision);
++
++//     return engineModelPointer;
++// }
++
++
++JNIEXPORT void JNICALL Java_ai_brain_model_modelWrapper_deleteEngineModel(JNIEnv* env, jobject obj, jlong engineModelPointer) {
++	EngineModel* engineModel = reinterpret_cast<EngineModel*>(engineModelPointer);
++	delete engineModel;
++}
++
++
++JNIEXPORT jobjectArray JNICALL Java_ai_brain_model_modelWrapper_detect(JNIEnv* env, jobject obj, jlong engineModelPointer, jstring imagePath) {
++
++	const char* img_pth = env->GetStringUTFChars(imagePath, NULL);
++	std::cout << img_pth << std::endl;
++	cv::Mat image = cv::imread(img_pth);
++	if (image.empty()) {
++		return NULL;
++	}
++
++	// detect
++	EngineModel* engineModel = reinterpret_cast<EngineModel*>(engineModelPointer);
++	std::vector<cv::Mat> batch_img;
++	cv::Mat temp0 = image.clone();
++	batch_img.push_back(temp0);
++	std::vector<BatchResult> batchResults = engineModel->detect(batch_img);
++
++	jclass resultClass  = env->FindClass("ai/brain/model/pred");
++	jmethodID constructor = env->GetMethodID(resultClass, "<init>", "(IFLjava/lang/String;)V");
++	jobjectArray resultObjs = env->NewObjectArray(batchResults[0].size(), resultClass, nullptr);
++	
++	for (int i = 0; i < batchResults[0].size(); i++){
++		int id = batchResults[0][i].id;
++		float prob = batchResults[0][i].prob;
++		int x = batchResults[0][i].rect.x;
++		int y = batchResults[0][i].rect.y;
++		int w = batchResults[0][i].rect.width;
++		int h = batchResults[0][i].rect.height;
++		std::string bboxStr = std::to_string(x) + "," + std::to_string(y) + "," + std::to_string(w) + "," + std::to_string(h);
++		jstring bbox = env->NewStringUTF(bboxStr.c_str());
++		jobject resultObj = env->NewObject(resultClass, constructor, id, prob, bbox);
++		env->SetObjectArrayElement(resultObjs, i, resultObj);
++		env->DeleteLocalRef(resultObj);
++		env->DeleteLocalRef(bbox);
++	}
++	return resultObjs;
++
++}
+\ No newline at end of file
+diff --git a/samples/ModelWrapper.h b/samples/ModelWrapper.h
+new file mode 100755
+index 0000000..9c25562
+--- /dev/null
++++ b/samples/ModelWrapper.h
+@@ -0,0 +1,22 @@
++#include <jni.h>
++#include <iostream>
++
++#ifndef _Included_ModelWrapper
++#define _Included_ModelWrapper
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++JNIEXPORT jlong JNICALL Java_ai_brain_model_modelWrapper_loadEngineModel
++    (JNIEnv*, jobject, jstring, jstring, jstring, jfloat, jfloat);
++// JNIEXPORT jlong JNICALL Java_ai_brain_model_modelWrapper_createEngineModel
++//     (JNIEnv*, jobject, jstring, jstring, jfloat, jfloat);
++JNIEXPORT void JNICALL Java_ai_brain_model_modelWrapper_deleteEngineModel
++    (JNIEnv*, jobject, jlong);
++JNIEXPORT jobjectArray JNICALL Java_ai_brain_model_modelWrapper_detect
++    (JNIEnv*, jobject, jlong, jstring);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+\ No newline at end of file
+diff --git a/samples/sample_detector.cpp b/samples/sample_detector.cpp
+index f2e3822..60f0fed 100644
+--- a/samples/sample_detector.cpp
++++ b/samples/sample_detector.cpp
+@@ -5,80 +5,39 @@
+ #include <thread>
+ 
+ 
+-int main()
+-{
+-	Config config_v3;
+-	config_v3.net_type = YOLOV3;
+-	config_v3.file_model_cfg = "../configs/yolov3.cfg";
+-	config_v3.file_model_weights = "../configs/yolov3.weights";
+-	config_v3.calibration_image_list_file_txt = "../configs/calibration_images.txt";
+-	config_v3.inference_precison =FP32;
+-	config_v3.detect_thresh = 0.5;
+-
+-	Config config_v3_tiny;
+-	config_v3_tiny.net_type = YOLOV3_TINY;
+-	config_v3_tiny.detect_thresh = 0.7;
+-	config_v3_tiny.file_model_cfg = "../configs/yolov3-tiny.cfg";
+-	config_v3_tiny.file_model_weights = "../configs/yolov3-tiny.weights";
+-	config_v3_tiny.calibration_image_list_file_txt = "../configs/calibration_images.txt";
+-	config_v3_tiny.inference_precison = FP32;
+-
+-	Config config_v4;
+-	config_v4.net_type = YOLOV4;
+-	config_v4.file_model_cfg = "../configs/yolov4.cfg";
+-	config_v4.file_model_weights = "../configs/yolov4.weights";
+-	config_v4.calibration_image_list_file_txt = "../configs/calibration_images.txt";
+-	config_v4.inference_precison =INT8;
+-	config_v4.detect_thresh = 0.5;
+ 
+-	Config config_v4_tiny;
+-	config_v4_tiny.net_type = YOLOV4_TINY;
+-	config_v4_tiny.detect_thresh = 0.5;
+-	config_v4_tiny.file_model_cfg = "../configs/yolov4-tiny.cfg";
+-	config_v4_tiny.file_model_weights = "../configs/yolov4-tiny.weights";
+-	config_v4_tiny.calibration_image_list_file_txt = "../configs/calibration_images.txt";
+-	config_v4_tiny.inference_precison = FP32;
+-
+-	Config config_v5;
+-	config_v5.net_type = YOLOV5;
+-	config_v5.detect_thresh = 0.5;
+-	config_v5.file_model_cfg = "../configs/yolov5-3.0/yolov5s.cfg";
+-	config_v5.file_model_weights = "../configs/yolov5-3.0/yolov5s.weights";
+-	config_v5.inference_precison = FP32;
+-
+-	std::unique_ptr<Detector> detector(new Detector());
+-	detector->init(config_v4);
+-	cv::Mat image0 = cv::imread("../configs/dog.jpg", cv::IMREAD_UNCHANGED);
+-	cv::Mat image1 = cv::imread("../configs/person.jpg", cv::IMREAD_UNCHANGED);
+-	std::vector<BatchResult> batch_res;
+-	Timer timer;
+-	for (;;)
++int main(int argc, char** argv)
++{
++// Flag set in the command line overrides the value in the flagfile
++	if (argc != 7)
+ 	{
+-		//prepare batch data
+-		std::vector<cv::Mat> batch_img;
+-		cv::Mat temp0 = image0.clone();
+-		cv::Mat temp1 = image1.clone();
+-		batch_img.push_back(temp0);
+-		//batch_img.push_back(temp1);
+-
+-		//detect
+-		timer.reset();
+-		detector->detect(batch_img, batch_res);
+-		timer.out("detect");
++	std::cout << "Missing parameter. Usage: ./vaidio-trt YOLO_CFG_FILE YOLO_WEIGHTS CALIBRATION_IMAGE_LIST_TXT CALIBRATION_TABLE_FILE ENGINE_PATH NET_TYPE" << std::endl;
++	return 2;
++	}
+ 
+-		//disp
+-		for (int i=0;i<batch_img.size();++i)
+-		{
+-			for (const auto &r : batch_res[i])
+-			{
+-				std::cout <<"batch "<<i<< " id:" << r.id << " prob:" << r.prob << " rect:" << r.rect << std::endl;
+-				cv::rectangle(batch_img[i], r.rect, cv::Scalar(255, 0, 0), 2);
+-				std::stringstream stream;
+-				stream << std::fixed << std::setprecision(2) << "id:" << r.id << "  score:" << r.prob;
+-				cv::putText(batch_img[i], stream.str(), cv::Point(r.rect.x, r.rect.y - 5), 0, 0.5, cv::Scalar(0, 0, 255), 2);
+-			}
+-			cv::imshow("image"+std::to_string(i), batch_img[i]);
+-		}
+-		cv::waitKey(10);
++	Config config;
++	config.file_model_cfg = argv[1];
++	config.file_model_weights = argv[2];
++	config.calibration_image_list_file_txt = argv[3];
++	config.calibration_table_path = argv[4];
++	config.engine_path = argv[5];
++	config.inference_precison =INT8;
++	config.detect_thresh = 0.5;
++	if (strcmp(argv[6], "yolov4") == 0) {
++		printf("net_type YOLOV4");
++		config.net_type = YOLOV4;
++	} else if (strcmp(argv[6], "yolov4-tiny") == 0) {
++                printf("net_type YOLOV4_TINY");
++		config.net_type = YOLOV4_TINY;
++	} else if (strcmp(argv[6], "yolov7") == 0) {
++                printf("net_type YOLOV7");
++		config.net_type = YOLOV7;
+ 	}
+-}
++	else if (strcmp(argv[6], "yolov7-tiny") == 0) {
++                printf("net_type YOLOV7_TINY");
++		config.net_type = YOLOV7_TINY;
++	}
++	
++	std::unique_ptr<Detector> detector(new Detector());
++	detector->init(config);
++}
+\ No newline at end of file
+-- 
+2.17.1
+
